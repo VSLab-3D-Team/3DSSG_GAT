@@ -9,6 +9,7 @@ from codeLib.common import filter_args_create
 import torch.optim as optim
 from ssg.trainer import trainer_dict
 from copy import deepcopy
+from datetime import datetime
 
 logger_py = logging.getLogger(__name__)
 
@@ -163,7 +164,12 @@ def get_logger(cfg):
         log_dir = cfg.wandb.dir
         if not os.path.exists(log_dir):
             os.makedirs(log_dir)
-        cfg.wandb.name = cfg.wandb.id = name
+        
+        current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_name = f"{name}_{current_time}"
+        
+        cfg.wandb.name = cfg.wandb.id = run_name
+        
         logger = filter_args_create(WandbLogger, {"cfg": cfg, **cfg.wandb})
         logger.log_config(cfg)
         cfg = logger.config
