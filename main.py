@@ -7,6 +7,7 @@ from ssg.checkpoints import CheckpointIO
 import cProfile
 import matplotlib
 import torch_geometric
+from datetime import datetime
 
 # disable GUI
 matplotlib.pyplot.switch_backend('agg')
@@ -20,6 +21,13 @@ logger_py = logging.getLogger(__name__)
 
 def main():
     cfg = ssg.Parse()
+
+    current_time = datetime.now().strftime("%Y%m%d_%H")
+
+    original_name = cfg.name
+    time_stamped_name = f"{original_name}_{current_time}"
+
+    cfg.name = time_stamped_name
 
     # Shorthands
     out_dir = os.path.join(cfg['training']['out_dir'], cfg.name)
