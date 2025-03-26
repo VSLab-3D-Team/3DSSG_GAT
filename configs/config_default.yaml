@@ -157,7 +157,7 @@ wandb:
  dry_run: false
  entity: 'kimh060612-kyung-hee-university'
  project: "3DSSG_GAT"
-# id: "001" # id will be set to name
+ id: "Reproduce"
  tags: ["ssg", "3dssg"]
  dir: logs/
 
