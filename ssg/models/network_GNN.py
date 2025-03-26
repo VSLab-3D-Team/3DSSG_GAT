@@ -316,7 +316,7 @@ class MSG_FAN(MessagePassing):
                  dim_node: int, dim_edge: int, dim_atten: int,
                  num_heads: int,
                  use_bn: bool,
-                 aggr='sum',
+                 aggr='max',
                  attn_dropout: float = 0.5,
                  flow: str = 'target_to_source'):
         super().__init__(aggr=aggr, flow=flow)
@@ -390,7 +390,7 @@ class MSG_FAN_EDGE_UPDATE(MessagePassing):
                  dim_node: int, dim_edge: int, dim_atten: int,
                  num_heads: int,
                  use_bn: bool,
-                 aggr='sum',
+                 aggr='max',
                  attn_dropout: float = 0.5,
                  flow: str = 'target_to_source'):
         super().__init__(aggr=aggr, flow=flow)
@@ -485,7 +485,7 @@ class MSG_FAN_Masking(MessagePassing):
                  dim_node: int, dim_edge: int, dim_atten: int,
                  num_heads: int,
                  use_bn: bool,
-                 aggr='sum',
+                 aggr='max',
                  attn_dropout: float = 0.5,
                  node_mask_prob: float = 0.3,
                  edge_mask_prob: float = 0.3,
