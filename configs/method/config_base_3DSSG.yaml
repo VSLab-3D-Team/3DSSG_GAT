@@ -9,7 +9,7 @@ model:
  node_feature_dim: 256
  edge_feature_dim: 256
  gnn:
-  method: fan_masking # [none, fan, triplet]
+  method: fan # [none, fan, triplet]
   hidden_dim: 256
   num_layers: 2
   num_heads: 8
