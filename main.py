@@ -22,7 +22,7 @@ logger_py = logging.getLogger(__name__)
 def main():
     cfg = ssg.Parse()
 
-    current_time = datetime.now().strftime("%Y%m%d_%H")
+    current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     original_name = cfg.name
     time_stamped_name = f"{original_name}_{current_time}"
