@@ -18,5 +18,6 @@ gnn_list = {
     'triplet': TripletGCNModel,
     'imp': TripletIMP,
     'vgfm': TripletVGfM,
-    'jointgnn': JointGNN
+    'jointgnn': JointGNN,
+    'fan_edge_update': GraphEdgeAttenNetworkLayers_edge_update
 }

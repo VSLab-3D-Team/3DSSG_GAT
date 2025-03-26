@@ -384,7 +384,101 @@ class MSG_FAN(MessagePassing):
     def update(self, x, x_ori):
         x[0] = self.update_node(torch.cat([x_ori, x[0]], dim=1))
         return x
+    
+class MSG_FAN_EDGE_UPDATE(MessagePassing):
+    def __init__(self,
+                 dim_node: int, dim_edge: int, dim_atten: int,
+                 num_heads: int,
+                 use_bn: bool,
+                 aggr='sum',
+                 attn_dropout: float = 0.5,
+                 flow: str = 'target_to_source'):
+        super().__init__(aggr=aggr, flow=flow)
+        assert dim_node % num_heads == 0
+        assert dim_edge % num_heads == 0
+        assert dim_atten % num_heads == 0
+        self.dim_node_proj = dim_node // num_heads
+        self.dim_edge_proj = dim_edge // num_heads
+        self.dim_value_proj = dim_atten // num_heads
+        self.num_head = num_heads
+        self.temperature = math.sqrt(self.dim_edge_proj)
 
+        self.nn_att = MLP([self.dim_node_proj+self.dim_edge_proj, self.dim_node_proj+self.dim_edge_proj,
+                           self.dim_edge_proj])
+        self.proj_q = build_mlp([dim_node, dim_node])
+        self.proj_k = build_mlp([dim_edge, dim_edge])
+        self.proj_v = build_mlp([dim_node, dim_atten])
+
+        self.combined_mlp = build_mlp([dim_node*2, dim_edge], do_bn=use_bn, on_last=False)
+        
+        self.cross_att1_q = build_mlp([dim_edge, dim_edge])
+        self.cross_att1_k = build_mlp([dim_edge, dim_edge])
+        self.cross_att1_v = build_mlp([dim_edge, dim_edge])
+        
+        self.cross_att2_q = build_mlp([dim_edge, dim_edge])
+        self.cross_att2_k = build_mlp([dim_edge, dim_edge])
+        self.cross_att2_v = build_mlp([dim_edge, dim_edge])
+        
+        self.edge_update_mlp = build_mlp([dim_edge*3, dim_edge*2, dim_edge], 
+                                         do_bn=use_bn, on_last=False)
+
+        self.dropout = torch.nn.Dropout(
+            attn_dropout) if attn_dropout > 0 else torch.nn.Identity()
+
+        self.update_node = build_mlp([dim_node+dim_atten, dim_node+dim_atten, dim_node],
+                                     do_bn=use_bn, on_last=False)
+
+    def forward(self, x, edge_feature, edge_index):
+        return self.propagate(edge_index, x=x, edge_feature=edge_feature, x_ori=x)
+
+    def message(self, x_i: Tensor, x_j: Tensor, edge_feature: Tensor) -> Tensor:
+        num_node = x_i.size(0)
+        
+        combined = self.combined_mlp(torch.cat([x_i, x_j], dim=1))
+        
+        q1 = self.cross_att1_q(combined)
+        k1 = self.cross_att1_k(edge_feature)
+        v1 = self.cross_att1_v(edge_feature)
+        
+        att1_scores = torch.matmul(q1, k1.transpose(-2, -1)) / math.sqrt(q1.size(-1))
+        att1_probs = torch.nn.functional.softmax(att1_scores, dim=-1)
+        att1_probs = self.dropout(att1_probs)
+        cross_att1_output = torch.matmul(att1_probs, v1)
+        
+        q2 = self.cross_att2_q(edge_feature)
+        k2 = self.cross_att2_k(combined)
+        v2 = self.cross_att2_v(combined)
+        
+        att2_scores = torch.matmul(q2, k2.transpose(-2, -1)) / math.sqrt(q2.size(-1))
+        att2_probs = torch.nn.functional.softmax(att2_scores, dim=-1)
+        att2_probs = self.dropout(att2_probs)
+        cross_att2_output = torch.matmul(att2_probs, v2)
+        
+        updated_edge = self.edge_update_mlp(
+            torch.cat([edge_feature, cross_att1_output, cross_att2_output], dim=1))
+        
+        x_i = self.proj_q(x_i).view(
+            num_node, self.dim_node_proj, self.num_head)  # [N,D,H]
+        edge = self.proj_k(edge_feature).view(
+            num_node, self.dim_edge_proj, self.num_head)  # [M,D,H]
+        x_j = self.proj_v(x_j)
+        
+        att = self.nn_att(torch.cat([x_i, edge], dim=1))  # N, D, H
+        prob = torch.nn.functional.softmax(att/self.temperature, dim=1)
+        prob = self.dropout(prob)
+        value = prob.reshape_as(x_j)*x_j
+
+        return [value, updated_edge, prob]
+
+    def aggregate(self, inputs: Tensor, index: Tensor, ptr: Optional[Tensor] = None,
+                  dim_size: Optional[int] = None) -> Tensor:
+        inputs[0] = scatter(inputs[0], index, dim=self.node_dim,
+                            dim_size=dim_size, reduce=self.aggr)
+        return inputs
+
+    def update(self, x, x_ori):
+        x[0] = self.update_node(torch.cat([x_ori, x[0]], dim=1))
+        return x
 
 class JointGNN(torch.nn.Module):
     def __init__(self, **kwargs):
@@ -510,6 +604,47 @@ class GraphEdgeAttenNetworkLayers(torch.nn.Module):
                 probs.append(prob.cpu().detach())
             else:
                 probs.append(None)
+        return node_feature, edge_feature, probs
+    
+class GraphEdgeAttenNetworkLayers_edge_update(torch.nn.Module):
+    """ A sequence of scene graph convolution layers with modified edge update mechanism """
+
+    def __init__(self, **kwargs):
+        super().__init__()
+        self.num_layers = kwargs['num_layers']
+
+        self.gconvs = torch.nn.ModuleList()
+        self.drop_out = None
+        if 'DROP_OUT_ATTEN' in kwargs:
+            self.drop_out = torch.nn.Dropout(kwargs['DROP_OUT_ATTEN'])
+
+        for _ in range(self.num_layers):
+            self.gconvs.append(filter_args_create(MSG_FAN_EDGE_UPDATE, kwargs))
+
+    def forward(self, data):
+        probs = list()
+        node_feature = data['node'].x
+        edge_feature = data['node', 'to', 'node'].x
+        edges_indices = data['node', 'to', 'node'].edge_index
+        
+        for i in range(self.num_layers):
+            gconv = self.gconvs[i]
+            node_feature, edge_feature, prob = gconv(
+                node_feature, edge_feature, edges_indices)
+
+            if i < (self.num_layers-1) or self.num_layers == 1:
+                node_feature = torch.nn.functional.relu(node_feature)
+                edge_feature = torch.nn.functional.relu(edge_feature)
+
+                if self.drop_out:
+                    node_feature = self.drop_out(node_feature)
+                    edge_feature = self.drop_out(edge_feature)
+
+            if prob is not None:
+                probs.append(prob.cpu().detach())
+            else:
+                probs.append(None)
+                
         return node_feature, edge_feature, probs
 
 
