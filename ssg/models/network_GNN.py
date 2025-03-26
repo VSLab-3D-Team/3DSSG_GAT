@@ -479,6 +479,119 @@ class MSG_FAN_EDGE_UPDATE(MessagePassing):
     def update(self, x, x_ori):
         x[0] = self.update_node(torch.cat([x_ori, x[0]], dim=1))
         return x
+    
+class MSG_FAN_Masking(MessagePassing):
+    def __init__(self,
+                 dim_node: int, dim_edge: int, dim_atten: int,
+                 num_heads: int,
+                 use_bn: bool,
+                 aggr='sum',
+                 attn_dropout: float = 0.5,
+                 node_mask_prob: float = 0.3,
+                 edge_mask_prob: float = 0.3,
+                 flow: str = 'target_to_source'):
+        super().__init__(aggr=aggr, flow=flow)
+        assert dim_node % num_heads == 0
+        assert dim_edge % num_heads == 0
+        assert dim_atten % num_heads == 0
+        self.dim_node_proj = dim_node // num_heads
+        self.dim_edge_proj = dim_edge // num_heads
+        self.dim_value_proj = dim_atten // num_heads
+        self.num_head = num_heads
+        self.temperature = math.sqrt(self.dim_edge_proj)
+        
+        self.node_mask_prob = node_mask_prob
+        self.edge_mask_prob = edge_mask_prob
+
+        self.nn_att = MLP([self.dim_node_proj+self.dim_edge_proj, self.dim_node_proj+self.dim_edge_proj,
+                           self.dim_edge_proj])
+
+        self.proj_q = build_mlp([dim_node, dim_node])
+        self.proj_k = build_mlp([dim_edge, dim_edge])
+        self.proj_v = build_mlp([dim_node, dim_atten])
+
+        self.nn_edge = build_mlp([dim_node*2+dim_edge, (dim_node+dim_edge), dim_edge],
+                                 do_bn=use_bn, on_last=False)
+
+        self.dropout = torch.nn.Dropout(
+            attn_dropout) if attn_dropout > 0 else torch.nn.Identity()
+
+        self.update_node = build_mlp([dim_node+dim_atten, dim_node+dim_atten, dim_node],
+                                     do_bn=use_bn, on_last=False)
+
+    def forward(self, x, edge_feature, edge_index):
+        if self.training:
+            return self.propagate_with_masking(edge_index, x=x, edge_feature=edge_feature, x_ori=x)
+        else:
+            return self.propagate(edge_index, x=x, edge_feature=edge_feature, x_ori=x)
+    
+    def propagate_with_masking(self, edge_index, **kwargs):
+        edge_mask = torch.rand(edge_index.size(1), device=edge_index.device) >= self.edge_mask_prob
+        
+        masked_edge_index = edge_index[:, edge_mask]
+        
+        x = kwargs.get('x')
+        edge_feature = kwargs.get('edge_feature')
+        x_ori = kwargs.get('x_ori')
+        
+        if edge_feature is not None:
+            masked_edge_feature = edge_feature[edge_mask]
+            kwargs['edge_feature'] = masked_edge_feature
+        
+        src_nodes = edge_index[0][edge_mask]
+        dst_nodes = edge_index[1][edge_mask]
+        
+        src_node_mask = torch.rand(src_nodes.size(0), device=edge_index.device) >= self.node_mask_prob
+        dst_node_mask = torch.rand(dst_nodes.size(0), device=edge_index.device) >= self.node_mask_prob
+        
+        if x is not None:
+            masked_x = x.clone()
+            
+            masked_src_nodes = src_nodes[~src_node_mask]
+            masked_dst_nodes = dst_nodes[~dst_node_mask]
+            
+            masked_x[masked_src_nodes] = 0
+            masked_x[masked_dst_nodes] = 0
+            
+            kwargs['x'] = masked_x
+        
+        return super().propagate(masked_edge_index, **kwargs)
+
+    def message(self, x_i: Tensor, x_j: Tensor, edge_feature: Tensor) -> Tensor:
+        '''
+        x_i [N, D_N]
+        x_j [N, D_N]
+        '''
+        num_node = x_i.size(0)
+
+        '''triplet'''
+        triplet_feature = torch.cat([x_i, edge_feature, x_j], dim=1)
+        triplet_feature = self.nn_edge(triplet_feature)
+
+        '''FAN'''
+        # proj
+        x_i = self.proj_q(x_i).view(
+            num_node, self.dim_node_proj, self.num_head)  # [N,D,H]
+        edge = self.proj_k(edge_feature).view(
+            num_node, self.dim_edge_proj, self.num_head)  # [M,D,H]
+        x_j = self.proj_v(x_j)
+        # est attention
+        att = self.nn_att(torch.cat([x_i, edge], dim=1))  # N, D, H
+        prob = torch.nn.functional.softmax(att/self.temperature, dim=1)
+        prob = self.dropout(prob)
+        value = prob.reshape_as(x_j)*x_j
+
+        return [value, triplet_feature, prob]
+
+    def aggregate(self, inputs: Tensor, index: Tensor, ptr: Optional[Tensor] = None,
+                  dim_size: Optional[int] = None) -> Tensor:
+        inputs[0] = scatter(inputs[0], index, dim=self.node_dim,
+                            dim_size=dim_size, reduce=self.aggr)
+        return inputs
+
+    def update(self, x, x_ori):
+        x[0] = self.update_node(torch.cat([x_ori, x[0]], dim=1))
+        return x
 
 class JointGNN(torch.nn.Module):
     def __init__(self, **kwargs):
@@ -645,6 +758,59 @@ class GraphEdgeAttenNetworkLayers_edge_update(torch.nn.Module):
             else:
                 probs.append(None)
                 
+        return node_feature, edge_feature, probs
+    
+class GraphEdgeAttenNetworkLayers_masking(torch.nn.Module):
+    """ A sequence of scene graph convolution layers with node and edge masking """
+
+    def __init__(self, **kwargs):
+        super().__init__()
+        self.num_layers = kwargs['num_layers']
+
+        self.gconvs = torch.nn.ModuleList()
+        self.drop_out = None
+        if 'DROP_OUT_ATTEN' in kwargs:
+            self.drop_out = torch.nn.Dropout(kwargs['DROP_OUT_ATTEN'])
+
+        node_mask_prob = kwargs.get('node_mask_prob', 0.1)
+        edge_mask_prob = kwargs.get('edge_mask_prob', 0.1)
+        
+        for _ in range(self.num_layers):
+            self.gconvs.append(MSG_FAN_Masking(
+                dim_node=kwargs['dim_node'],
+                dim_edge=kwargs['dim_edge'],
+                dim_atten=kwargs['dim_atten'],
+                num_heads=kwargs['num_heads'],
+                use_bn=kwargs['use_bn'],
+                aggr=kwargs['aggr'],
+                attn_dropout=kwargs.get('attn_dropout', 0.1),
+                node_mask_prob=node_mask_prob,
+                edge_mask_prob=edge_mask_prob,
+                flow=kwargs.get('flow', 'target_to_source')
+            ))
+
+    def forward(self, data):
+        probs = list()
+        node_feature = data['node'].x
+        edge_feature = data['node', 'to', 'node'].x
+        edges_indices = data['node', 'to', 'node'].edge_index
+        for i in range(self.num_layers):
+            gconv = self.gconvs[i]
+            node_feature, edge_feature, prob = gconv(
+                node_feature, edge_feature, edges_indices)
+
+            if i < (self.num_layers-1) or self.num_layers == 1:
+                node_feature = torch.nn.functional.relu(node_feature)
+                edge_feature = torch.nn.functional.relu(edge_feature)
+
+                if self.drop_out:
+                    node_feature = self.drop_out(node_feature)
+                    edge_feature = self.drop_out(edge_feature)
+
+            if prob is not None:
+                probs.append(prob.cpu().detach())
+            else:
+                probs.append(None)
         return node_feature, edge_feature, probs
 
 
