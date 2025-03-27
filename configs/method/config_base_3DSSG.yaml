@@ -10,8 +10,6 @@ model:
  edge_feature_dim: 256
  dim_clip: 512
  use_text_attention: true
- node_class_names: ${node_class_names}
- edge_class_names: ${edge_class_names}
  gnn:
   method: fan # [none, fan, triplet]
   hidden_dim: 256

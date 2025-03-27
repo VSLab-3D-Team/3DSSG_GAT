@@ -85,42 +85,59 @@ def get_model(cfg, num_obj_cls, num_rel_cls):
         device (device): pytorch device
         dataset (dataset): dataset
     '''
+    # 데이터셋에서 클래스 이름 목록을 가져옴
+    dataset = get_dataset(cfg, 'train')
+    
     if cfg.model.method == 'sgfn' or cfg.model.method == 'sgpn' or cfg.model.method == 'jointsg':
-        return method_dict[cfg.model.method](
+        model = method_dict[cfg.model.method](
             cfg=cfg,
             num_obj_cls=num_obj_cls,
             num_rel_cls=num_rel_cls,
             device=cfg.DEVICE).to(cfg.DEVICE)
     elif cfg.model.method == 'mv':
-        return method_dict[cfg.model.method](
+        model = method_dict[cfg.model.method](
             cfg=cfg,
             num_obj_cls=num_obj_cls,
             device=cfg.DEVICE).to(cfg.DEVICE)
     elif cfg.model.method == 'sv':
-        return method_dict[cfg.model.method](
+        model = method_dict[cfg.model.method](
             cfg=cfg,
             num_obj_cls=num_obj_cls,
             device=cfg.DEVICE).to(cfg.DEVICE)
     elif cfg.model.method == 'imp':
-        # logger_py.info('use IMP implementation')
-        return method_dict[cfg.model.method](
+        model = method_dict[cfg.model.method](
             cfg=cfg,
             num_obj_cls=num_obj_cls,
             num_rel_cls=num_rel_cls,
             device=cfg.DEVICE).to(cfg.DEVICE)
+    else:
+        node_encoder = get_node_encoder(cfg, cfg.DEVICE)
+        edge_encoder = get_edge_encoder(cfg, cfg.DEVICE)
+        gnn = get_gnn(cfg, cfg.DEVICE)
 
-    node_encoder = get_node_encoder(cfg, cfg.DEVICE)
-    edge_encoder = get_edge_encoder(cfg, cfg.DEVICE)
-    gnn = get_gnn(cfg, cfg.DEVICE)
+        model = method_dict[cfg.model.method](
+            cfg=cfg,
+            num_obj_cls=num_obj_cls,
+            num_rel_cls=num_rel_cls,
+            node_encoder=node_encoder,
+            edge_encoder=edge_encoder,
+            gnn=gnn,
+            device=cfg.DEVICE).to(cfg.DEVICE)
 
-    model = method_dict[cfg.model.method](
-        cfg=cfg,
-        num_obj_cls=num_obj_cls,
-        num_rel_cls=num_rel_cls,
-        node_encoder=node_encoder,
-        edge_encoder=edge_encoder,
-        gnn=gnn,
-        device=cfg.DEVICE).to(cfg.DEVICE)
+    if hasattr(cfg.model, 'use_text_attention') and cfg.model.use_text_attention:
+        if hasattr(model, 'gnn') and model.gnn is not None:
+            if hasattr(model.gnn, 'node_class_names'):
+                model.gnn.node_class_names = dataset.classNames
+                model.gnn.edge_class_names = dataset.relationNames
+                
+                if hasattr(model.gnn, 'gconvs'):
+                    for gconv in model.gnn.gconvs:
+                        if hasattr(gconv, 'node_class_names'):
+                            gconv.node_class_names = dataset.classNames
+                            gconv.edge_class_names = dataset.relationNames
+                            
+                            if hasattr(gconv, 'clip_encoder'):
+                                gconv.clip_encoder.device = cfg.DEVICE
 
     return model
 
@@ -143,20 +160,12 @@ def get_gnn(cfg, device):
         'dim_atten': cfg.model.gnn.hidden_dim,
         'num_layers': cfg.model.gnn.num_layers,
         'num_heads': cfg.model.gnn.num_heads,
-        'use_bn': cfg.model.gnn.get('use_bn', True),
         'aggr': cfg.model.gnn.get('aggr', 'max'),
         'DROP_OUT_ATTEN': cfg.model.gnn.drop_out
     }
     
     if hasattr(cfg.model, 'dim_clip') and hasattr(cfg.model, 'use_text_attention'):
         if cfg.model.gnn.method == 'fan' and cfg.model.use_text_attention:
-            gnn_args.update({
-                'dim_clip': cfg.model.dim_clip,
-                'use_text_attention': cfg.model.use_text_attention,
-                'node_class_names': cfg.model.get('node_class_names', []),
-                'edge_class_names': cfg.model.get('edge_class_names', [])
-            })
-            
             return ssg.models.network_GNN.GraphEdgeAttenNetworkLayers(**gnn_args)
     
     return ssg.models.gnn_list[cfg.model.gnn.method](**gnn_args)
