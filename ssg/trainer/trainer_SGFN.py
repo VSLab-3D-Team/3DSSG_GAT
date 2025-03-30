@@ -193,6 +193,8 @@ class Trainer_SGFN(BaseTrainer, EvalInst):
                     edge_cls = edge_cls[:min_edges]
                     gt_edge = gt_edge[:min_edges]
                     
+                    data['node', 'to', 'node'].y = gt_edge
+                    
                     print(f"Adjusted edge_cls and gt_edge to size {min_edges}")
                 else:
                     print(f"Error: Size mismatch in eval mode between edge_cls {edge_cls.shape} and gt_edge {gt_edge.shape}")
@@ -216,8 +218,16 @@ class Trainer_SGFN(BaseTrainer, EvalInst):
             data['node'].pd = node_cls.detach()
 
             if edge_cls is not None:
+                if 'edge_index_original' not in data['node', 'to', 'node']:
+                    data['node', 'to', 'node'].edge_index_original = data['node', 'to', 'node'].edge_index.clone()
+                
+                if edge_cls.shape[0] != data['node', 'to', 'node'].edge_index.shape[1]:
+                    data['node', 'to', 'node'].edge_index = data['node', 'to', 'node'].edge_index_original[:, :edge_cls.shape[0]]
+                    print(f"Adjusted edge_index from {data['node', 'to', 'node'].edge_index_original.shape} to {data['node', 'to', 'node'].edge_index.shape}")
+                
                 edge_cls = torch.sigmoid(edge_cls.detach())
                 data['node', 'to', 'node'].pd = edge_cls.detach()
+            
             eval_tool.add(data)
 
         # if check_valid(logs):
