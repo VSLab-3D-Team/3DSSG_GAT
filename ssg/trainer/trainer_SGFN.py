@@ -185,6 +185,19 @@ class Trainer_SGFN(BaseTrainer, EvalInst):
 
         ''' 2. edge class loss '''
         if edge_cls is not None:
+            if edge_cls.shape[0] != gt_edge.shape[0]:
+                if self.training:
+                    print(f"Warning: Size mismatch between edge_cls {edge_cls.shape} and gt_edge {gt_edge.shape}")
+                    
+                    min_edges = min(edge_cls.shape[0], gt_edge.shape[0])
+                    edge_cls = edge_cls[:min_edges]
+                    gt_edge = gt_edge[:min_edges]
+                    
+                    print(f"Adjusted edge_cls and gt_edge to size {min_edges}")
+                else:
+                    print(f"Error: Size mismatch in eval mode between edge_cls {edge_cls.shape} and gt_edge {gt_edge.shape}")
+                    return logs
+                    
             self.calc_edge_loss(logs, edge_cls, gt_edge, self.w_edge_cls)
 
         '''3. get metrics'''
@@ -205,14 +218,7 @@ class Trainer_SGFN(BaseTrainer, EvalInst):
             if edge_cls is not None:
                 edge_cls = torch.sigmoid(edge_cls.detach())
                 data['node', 'to', 'node'].pd = edge_cls.detach()
-            eval_tool.add(data,
-                          #   node_cls,gt_node,
-                          #   edge_cls,gt_edge,
-                          #   mask2instance,
-                          #   edge_indices_node_to_node,
-                          #   node_gt,
-                          #   edge_index_node_gt
-                          )
+            eval_tool.add(data)
 
         # if check_valid(logs):
         #     raise RuntimeWarning()

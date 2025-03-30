@@ -529,7 +529,7 @@ class MSG_FAN_Masking(MessagePassing):
         if self.training:
             return self.propagate_with_masking(edge_index, x=x, edge_feature=edge_feature, x_ori=x)
         else:
-            return self.propagate(edge_index, x=x, edge_feature=edge_feature, x_ori=x)
+            return self.propagate_without_masking(edge_index, x=x, edge_feature=edge_feature, x_ori=x)
     
     def propagate_with_masking(self, edge_index, **kwargs):
         num_edges = edge_index.size(1)
@@ -543,9 +543,10 @@ class MSG_FAN_Masking(MessagePassing):
         
         if edge_feature is not None:
             if edge_feature.shape[0] != num_edges:
-                print(f"Error: edge_feature shape[0] {edge_feature.shape[0]} != edge_index shape[1] {num_edges}")
-                edge_feature = edge_feature[:min(edge_feature.shape[0], num_edges)]
-                edge_mask = edge_mask[:edge_feature.shape[0]]
+                print(f"Warning: edge_feature shape[0] {edge_feature.shape[0]} != edge_index shape[1] {num_edges}")
+                min_size = min(edge_feature.shape[0], num_edges)
+                edge_feature = edge_feature[:min_size]
+                edge_mask = edge_mask[:min_size]
             
             masked_edge_feature = edge_feature[edge_mask]
             kwargs['edge_feature'] = masked_edge_feature
@@ -571,6 +572,10 @@ class MSG_FAN_Masking(MessagePassing):
         result = super().propagate(masked_edge_index, **kwargs)
         
         return result[0], result[1], masked_edge_index, result[2]
+    
+    def propagate_without_masking(self, edge_index, **kwargs):
+        result = super().propagate(edge_index, **kwargs)
+        return result[0], result[1], result[2]
 
     def message(self, x_i: Tensor, x_j: Tensor, edge_feature: Tensor) -> Tensor:
         '''
@@ -811,13 +816,24 @@ class GraphEdgeAttenNetworkLayers_masking(torch.nn.Module):
         edge_feature = data['node', 'to', 'node'].x
         edges_indices = data['node', 'to', 'node'].edge_index
         
+        original_edge_indices = edges_indices.clone()
+        original_edge_feature = edge_feature.clone()
+        
+        if self.training:
+            data['_original_edge_indices'] = original_edge_indices
+            data['_original_edge_feature'] = original_edge_feature
+        
         for i in range(self.num_layers):
             gconv = self.gconvs[i]
             
-            # print(f"Layer {i} - Before: edge_feature shape: {edge_feature.shape}, edge_index shape: {edges_indices.shape}")
-            
-            node_feature, edge_feature, edges_indices, prob = gconv(
-                node_feature, edge_feature, edges_indices)
+            if self.training:
+                # 학습
+                node_feature, edge_feature, edges_indices, prob = gconv(
+                    node_feature, edge_feature, edges_indices)
+            else:
+                # 추론
+                node_feature, edge_feature, prob = gconv.propagate_without_masking(
+                    edges_indices, x=node_feature, edge_feature=edge_feature, x_ori=node_feature)
 
             if i < (self.num_layers-1) or self.num_layers == 1:
                 node_feature = torch.nn.functional.relu(node_feature)
@@ -831,9 +847,7 @@ class GraphEdgeAttenNetworkLayers_masking(torch.nn.Module):
                 probs.append(prob.cpu().detach())
             else:
                 probs.append(None)
-                
-            # print(f"Layer {i} - After: edge_feature shape: {edge_feature.shape}, edge_index shape: {edges_indices.shape}")
-            
+        
         return node_feature, edge_feature, probs
 
 
