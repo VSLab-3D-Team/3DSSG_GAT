@@ -137,29 +137,15 @@ def get_gnn(cfg, device):
     if cfg.model.gnn.method == 'none':
         return None
     
-    gnn_args = {
-        'dim_node': cfg.model.node_feature_dim,
-        'dim_edge': cfg.model.edge_feature_dim,
-        'dim_atten': cfg.model.gnn.hidden_dim,
-        'num_layers': cfg.model.gnn.num_layers,
-        'num_heads': cfg.model.gnn.num_heads,
-        'use_bn': cfg.model.gnn.get('use_bn', True),
-        'aggr': cfg.model.gnn.get('aggr', 'max'),
-        'DROP_OUT_ATTEN': cfg.model.gnn.drop_out
-    }
-    
-    if hasattr(cfg.model, 'dim_clip') and hasattr(cfg.model, 'use_text_attention'):
-        if cfg.model.gnn.method == 'fan' and cfg.model.use_text_attention:
-            gnn_args.update({
-                'dim_clip': cfg.model.dim_clip,
-                'use_text_attention': cfg.model.use_text_attention,
-                'node_class_names': cfg.model.get('node_class_names', []),
-                'edge_class_names': cfg.model.get('edge_class_names', [])
-            })
-            
-            return ssg.models.network_GNN.GraphEdgeAttenNetworkLayers(**gnn_args)
-    
-    return ssg.models.gnn_list[cfg.model.gnn.method](**gnn_args)
+    return ssg.models.gnn_list[cfg.model.gnn.method](
+        dim_node=cfg.model.node_feature_dim,
+        dim_edge=cfg.model.edge_feature_dim,
+        dim_atten=cfg.model.gnn.hidden_dim,
+        num_layers=cfg.model.gnn.num_layers,
+        num_heads=cfg.model.gnn.num_heads,
+        aggr='max',
+        DROP_OUT_ATTEN=cfg.model.gnn.drop_out
+    )
 
 def get_logger(cfg):
     method = cfg.logging.method.lower()

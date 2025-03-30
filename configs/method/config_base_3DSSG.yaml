@@ -8,12 +8,8 @@ model:
  num_points_union: 512 # for 3DSSG
  node_feature_dim: 256
  edge_feature_dim: 256
- dim_clip: 512
- use_text_attention: true
- node_class_names: ${node_class_names}
- edge_class_names: ${edge_class_names}
  gnn:
-  method: fan # [none, fan, triplet]
+  method: fan_edge_update # [none, fan, triplet]
   hidden_dim: 256
   num_layers: 2
   num_heads: 8
@@ -22,8 +18,6 @@ model:
 #  node_classifier:
 #   with_bn: false
 #   dropout: 0.3
-training:
-  lambda_attn_reg: 0.1
 data:
   load_images: false
   load_points: true
