@@ -773,8 +773,8 @@ class GraphEdgeAttenNetworkLayers_masking(torch.nn.Module):
         if 'DROP_OUT_ATTEN' in kwargs:
             self.drop_out = torch.nn.Dropout(kwargs['DROP_OUT_ATTEN'])
 
-        node_mask_prob = kwargs.get('node_mask_prob', 0.3)
-        edge_mask_prob = kwargs.get('edge_mask_prob', 0.3)
+        node_mask_prob = kwargs.get('node_mask_prob', 0.1)
+        edge_mask_prob = kwargs.get('edge_mask_prob', 0.1)
         
         for _ in range(self.num_layers):
             self.gconvs.append(MSG_FAN_Masking(
