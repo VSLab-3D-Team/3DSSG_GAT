@@ -19,10 +19,6 @@ from copy import deepcopy
 from torch_scatter import scatter
 from codeLib.common import filter_args_create
 import ssg
-import torch.nn.functional as F
-import clip
-from typing import Optional, List, Dict
-from .network_util import build_mlp, MLP
 
 
 class TripletGCN(MessagePassing):
