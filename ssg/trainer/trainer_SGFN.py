@@ -186,7 +186,7 @@ class Trainer_SGFN(BaseTrainer, EvalInst):
         ''' 2. edge class loss '''
         if edge_cls is not None:
             if edge_cls.shape[0] != gt_edge.shape[0]:
-                if self.training:
+                if not eval_mode:
                     print(f"Warning: Size mismatch between edge_cls {edge_cls.shape} and gt_edge {gt_edge.shape}")
                     
                     min_edges = min(edge_cls.shape[0], gt_edge.shape[0])
