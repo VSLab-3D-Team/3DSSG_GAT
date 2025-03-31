@@ -355,90 +355,39 @@ class EdgeEncoder_SGFN(nn.Module):
 #     def forward(self, x):
 #         return self.model(x)
 
-class SetAbstraction(nn.Module):
-    def __init__(self, ratio, radius, nsample, in_channel, mlp_list, group_all=False):
-        super(SetAbstraction, self).__init__()
-        self.ratio = ratio
-        self.radius = radius
-        self.nsample = nsample
-        self.group_all = group_all
-        
-        self.mlp_convs = nn.ModuleList()
-        self.mlp_bns = nn.ModuleList()
-        
-        last_channel = in_channel
-        for out_channel in mlp_list:
-            self.mlp_convs.append(nn.Conv2d(last_channel, out_channel, 1))
-            self.mlp_bns.append(nn.BatchNorm2d(out_channel))
-            last_channel = out_channel
+def query_ball_point(radius, nsample, xyz, new_xyz):
 
-    def forward(self, xyz, points):
-        """
-        xyz: 입력 포인트 클라우드 좌표 [B, N, 3]
-        points: 입력 포인트 특징 [B, N, C]
-        """
-        if self.group_all:
-            new_xyz, new_points = self.sample_and_group_all(xyz, points)
-        else:
-            new_xyz, new_points = self.sample_and_group(xyz, points, self.ratio, self.radius, self.nsample)
-        
-        for i, conv in enumerate(self.mlp_convs):
-            bn = self.mlp_bns[i]
-            new_points = F.relu(bn(conv(new_points)))
-        
-        new_points = torch.max(new_points, dim=3)[0]  # [B, D, npoint]
-        
-        new_points = new_points.transpose(1, 2)  # [B, npoint, D]
-        
-        return new_xyz, new_points
+    device = xyz.device
+    batch_size, num_points, _ = xyz.shape
+    _, npoint, _ = new_xyz.shape
     
-    def sample_and_group_all(self, xyz, points):
-
-        batch_size, num_points, _ = xyz.shape
-        device = xyz.device
-        
-        new_xyz = torch.zeros(batch_size, 1, 3, device=device)
-        
-        grouped_xyz = xyz.view(batch_size, 1, num_points, 3)
-        
-        if points is not None:
-            grouped_points = points.view(batch_size, 1, num_points, -1)
-            grouped_points = torch.cat([grouped_xyz, grouped_points], dim=-1)
-        else:
-            grouped_points = grouped_xyz
-        
-        grouped_points = grouped_points.permute(0, 3, 1, 2)  # [B, C, 1, N]
-        
-        return new_xyz, grouped_points
+    idx = torch.zeros(batch_size, npoint, nsample, dtype=torch.long, device=device)
     
-    def sample_and_group(self, xyz, points, ratio, radius, nsample):
+    for b in range(batch_size):
+        dist = torch.sum((xyz[b:b+1, :, None, :] - new_xyz[b:b+1, None, :, :]) ** 2, dim=-1)  # [1, N, M]
+        dist = dist.transpose(1, 2).contiguous()  # [1, M, N]
+        
+        dist, idx_sorted = torch.sort(dist, dim=2)  # [1, M, N]
+        
+        dist = dist[:, :, :nsample]  # [1, M, nsample]
+        idx_sorted = idx_sorted[:, :, :nsample]  # [1, M, nsample]
 
-        batch_size, num_points, _ = xyz.shape
-        device = xyz.device
+        mask = dist > radius * radius  # [1, M, nsample]
         
-        npoint = max(1, int(num_points * ratio))
-        fps_idx = farthest_point_sample(xyz, npoint)
-        new_xyz = index_points(xyz, fps_idx)  # [B, npoint, 3]
+        first_idx = idx_sorted[:, :, 0].unsqueeze(-1).expand(-1, -1, nsample)  # [1, M, nsample]
         
-        idx = query_ball_point(radius, nsample, xyz, new_xyz)
-        grouped_xyz = index_points(xyz, idx)  # [B, npoint, nsample, 3]
+        idx_sorted = torch.where(mask, first_idx, idx_sorted)
         
-        grouped_xyz_norm = grouped_xyz - new_xyz.unsqueeze(2)
-        
-        if points is not None:
-            grouped_points = index_points(points, idx)  # [B, npoint, nsample, C]
-            grouped_points = torch.cat([grouped_xyz_norm, grouped_points], dim=-1)
-        else:
-            grouped_points = grouped_xyz_norm
-        
-        grouped_points = grouped_points.permute(0, 3, 1, 2)  # [B, C, npoint, nsample]
-        
-        return new_xyz, grouped_points
+        idx[b] = idx_sorted[0]
+    
+    return idx
 
 def farthest_point_sample(xyz, npoint):
 
     device = xyz.device
     batch_size, num_points, _ = xyz.shape
+    
+    npoint = min(npoint, num_points)
     
     centroids = torch.zeros(batch_size, npoint, dtype=torch.long, device=device)
     distance = torch.ones(batch_size, num_points, device=device) * 1e10
@@ -460,7 +409,6 @@ def farthest_point_sample(xyz, npoint):
     
     return centroids
 
-
 def index_points(points, idx):
 
     device = points.device
@@ -476,30 +424,91 @@ def index_points(points, idx):
     
     return new_points
 
-def query_ball_point(radius, nsample, xyz, new_xyz):
+class SetAbstraction(nn.Module):
+    def __init__(self, ratio, radius, nsample, in_channel, mlp_list, group_all=False):
+        super(SetAbstraction, self).__init__()
+        self.ratio = ratio
+        self.radius = radius
+        self.nsample = nsample
+        self.group_all = group_all
+        
+        self.mlp_convs = nn.ModuleList()
+        self.mlp_bns = nn.ModuleList()
+        
+        last_channel = in_channel
+        for out_channel in mlp_list:
+            self.mlp_convs.append(nn.Conv2d(last_channel, out_channel, 1))
+            self.mlp_bns.append(nn.BatchNorm2d(out_channel))
+            last_channel = out_channel
 
-    device = xyz.device
-    batch_size, num_points, _ = xyz.shape
-    _, npoint, _ = new_xyz.shape
+    def forward(self, xyz, points):
+ 
+        if xyz.size(1) == 0:  # 포인트가 없는 경우
+            batch_size = xyz.size(0)
+            npoint = 1 if not self.group_all else 1
+            out_dim = self.mlp_convs[-1].out_channels
+            return (
+                torch.zeros(batch_size, npoint, 3, device=xyz.device),
+                torch.zeros(batch_size, npoint, out_dim, device=xyz.device)
+            )
+        
+        if self.group_all:
+            new_xyz, new_points = self.sample_and_group_all(xyz, points)
+        else:
+            new_xyz, new_points = self.sample_and_group(xyz, points, self.ratio, self.radius, self.nsample)
+        
+        for i, conv in enumerate(self.mlp_convs):
+            bn = self.mlp_bns[i]
+            new_points = F.relu(bn(conv(new_points)))
+        
+        new_points = torch.max(new_points, dim=3)[0]  # [B, D, npoint]
+        
+        new_points = new_points.transpose(1, 2)  # [B, npoint, D]
+        
+        return new_xyz, new_points
     
-    idx = torch.zeros(batch_size, npoint, nsample, dtype=torch.long, device=device)
+    def sample_and_group_all(self, xyz, points):
+       
+        batch_size, num_points, _ = xyz.shape
+        device = xyz.device
+        
+        new_xyz = torch.zeros(batch_size, 1, 3, device=device)
+        
+        grouped_xyz = xyz.view(batch_size, 1, num_points, 3)
+        
+        if points is not None:
+            grouped_points = points.view(batch_size, 1, num_points, -1)
+            grouped_points = torch.cat([grouped_xyz, grouped_points], dim=-1)
+        else:
+            grouped_points = grouped_xyz
+        
+        grouped_points = grouped_points.permute(0, 3, 1, 2)  # [B, C, 1, N]
+        
+        return new_xyz, grouped_points
     
-    for b in range(batch_size):
-        centered_xyz = xyz[b].unsqueeze(0)  # (1, N, 3)
-        centered_new_xyz = new_xyz[b].unsqueeze(0)  # (1, M, 3)
+    def sample_and_group(self, xyz, points, ratio, radius, nsample):
         
-        dist = torch.cdist(centered_new_xyz, centered_xyz, p=2)  # (1, M, N)
+        batch_size, num_points, _ = xyz.shape
+        device = xyz.device
         
-        _, idx_sorted = torch.sort(dist, dim=2)  # (1, M, N)
-        idx_sorted = idx_sorted[:, :, :nsample]  # (1, M, nsample)
+        npoint = max(1, int(num_points * ratio)) 
+        fps_idx = farthest_point_sample(xyz, npoint)
+        new_xyz = index_points(xyz, fps_idx)  # [B, npoint, 3]
         
-        mask = dist.gather(2, idx_sorted) > radius
-        first_idx = idx_sorted[:, :, 0].unsqueeze(2).expand(-1, -1, nsample)
-        idx_sorted[mask] = first_idx[mask]
+        idx = query_ball_point(radius, nsample, xyz, new_xyz)
+        grouped_xyz = index_points(xyz, idx)  # [B, npoint, nsample, 3]
         
-        idx[b] = idx_sorted[0]
-    
-    return idx
+        grouped_xyz_norm = grouped_xyz - new_xyz.unsqueeze(2)
+        
+        if points is not None:
+            grouped_points = index_points(points, idx)  # [B, npoint, nsample, C]
+            grouped_points = torch.cat([grouped_xyz_norm, grouped_points], dim=-1)
+        else:
+            grouped_points = grouped_xyz_norm
+        
+        grouped_points = grouped_points.permute(0, 3, 1, 2)  # [B, C, npoint, nsample]
+        
+        return new_xyz, grouped_points
 
 class EdgeEncoder_SGPN(nn.Module):
     def __init__(self, cfg, device):
@@ -512,11 +521,12 @@ class EdgeEncoder_SGPN(nn.Module):
             dim_pts += 3
         if cfg.model.use_normal:
             dim_pts += 3
-        self.dim_pts = dim_pts + 1
+        self.dim_pts = dim_pts + 1  
         
         # 인스턴스 스테이지: [1, 4, 2, 2] -> 총 16배 다운샘플링
         # 관계 스테이지: [2, 2] -> 추가 4배 다운샘플링 (총 64배)
         
+        # 인스턴스 스테이지 (세밀한 객체 특징 추출)
         self.instance_stage = nn.ModuleList([
             SetAbstraction(ratio=1.0, radius=0.1, nsample=32, 
                            in_channel=self.dim_pts, mlp_list=[64, 64], group_all=False),
@@ -555,14 +565,19 @@ class EdgeEncoder_SGPN(nn.Module):
         
         for i, sa_module in enumerate(self.instance_stage):
             xyz, features = sa_module(xyz, features)
+            if xyz.size(1) == 0:  # 포인트가 없는 경우 처리
+                return torch.zeros(batch_size, self.cfg.model.edge_feature_dim, device=self._device)
         
         instance_xyz, instance_features = xyz, features
         
         for i, sa_module in enumerate(self.relation_stage):
             xyz, features = sa_module(xyz, features)
+            if xyz.size(1) == 0:  # 포인트가 없는 경우 처리
+                return torch.zeros(batch_size, self.cfg.model.edge_feature_dim, device=self._device)
         
         if features.size(1) > 0:  # 포인트가 남아있는 경우
             global_feature = features.squeeze(1)  # [B, C]
+            global_feature = self.global_feat(global_feature)
             
             return global_feature
         else:
