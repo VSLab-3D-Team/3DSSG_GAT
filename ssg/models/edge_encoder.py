@@ -334,159 +334,159 @@ class EdgeEncoder_SGFN(nn.Module):
         return edges_feature
 
 
-# class EdgeEncoder_SGPN(nn.Module):
-#     def __init__(self, cfg, device):
-#         super().__init__()
-#         self._device = device
-
-#         dim_pts = 3
-#         if cfg.model.use_rgb:
-#             dim_pts += 3
-#         if cfg.model.use_normal:
-#             dim_pts += 3
-#         self.dim_pts = dim_pts+1  # mask
-
-#         self.model = point_encoder_dict['pointnet'](point_size=self.dim_pts,
-#                                                     out_size=cfg.model.edge_feature_dim,
-#                                                     batch_norm=cfg.model.node_encoder.with_bn)
-
-#     def forward(self, x):
-#         return self.model(x)
-
 class EdgeEncoder_SGPN(nn.Module):
     def __init__(self, cfg, device):
         super().__init__()
         self._device = device
-        self.cfg = cfg
 
-        # 입력 차원 설정
         dim_pts = 3
         if cfg.model.use_rgb:
             dim_pts += 3
         if cfg.model.use_normal:
             dim_pts += 3
-        self.dim_pts = dim_pts + 1  # 마스크 포함
-        
-        # HDSN의 계층적 구조
-        # 인스턴스 스테이지: 더 세밀한 특징 추출
-        self.instance_stage = nn.Sequential(
-            nn.Conv1d(self.dim_pts, 64, 1),
-            nn.BatchNorm1d(64, track_running_stats=True, momentum=0.01),
-            nn.ReLU(),
-            nn.Conv1d(64, 128, 1),
-            nn.BatchNorm1d(128, track_running_stats=True, momentum=0.01),
-            nn.ReLU(),
-            nn.Conv1d(128, 256, 1),
-            nn.BatchNorm1d(256, track_running_stats=True, momentum=0.01),
-            nn.ReLU()
-        )
-        
-        # 관계 스테이지: 더 넓은 문맥 특징 추출
-        self.relation_stage = nn.Sequential(
-            nn.Conv1d(256, 512, 1),
-            nn.BatchNorm1d(512, track_running_stats=True, momentum=0.01),
-            nn.ReLU(),
-            nn.Conv1d(512, cfg.model.edge_feature_dim, 1),
-            nn.BatchNorm1d(cfg.model.edge_feature_dim, track_running_stats=True, momentum=0.01),
-            nn.ReLU()
-        )
-        
-        # 계층적 다운샘플링 적용 (인스턴스 스테이지 16배, 관계 스테이지 4배)
-        self.instance_downsample = 16
-        self.relation_downsample = 4
-        
-        # 최종 특징 통합 (배치 크기 1 대응을 위해 BatchNorm 대신 LayerNorm 사용)
-        self.global_feat = nn.Sequential(
-            nn.Linear(cfg.model.edge_feature_dim, cfg.model.edge_feature_dim),
-            nn.LayerNorm(cfg.model.edge_feature_dim),  # BatchNorm1d 대신 LayerNorm 사용
-            nn.ReLU()
-        )
+        self.dim_pts = dim_pts+1  # mask
+
+        self.model = point_encoder_dict['pointnet'](point_size=self.dim_pts,
+                                                    out_size=cfg.model.edge_feature_dim,
+                                                    batch_norm=cfg.model.node_encoder.with_bn)
 
     def forward(self, x):
-        """
-        x: 입력 포인트 클라우드 (형태 자동 감지)
-        """
-        # 입력 텐서 형태 확인 및 조정
-        if len(x.shape) == 3:
-            if x.shape[1] == self.dim_pts and x.shape[2] > self.dim_pts:
-                # 이미 [B, C, N] 형태인 경우
-                batch_size, channels, num_points = x.shape
-            elif x.shape[2] == self.dim_pts and x.shape[1] > self.dim_pts:
-                # [B, N, C] 형태인 경우 -> [B, C, N]으로 변환
-                x = x.transpose(1, 2).contiguous()
-                batch_size, channels, num_points = x.shape
-            else:
-                # 차원 불명확한 경우
-                raise ValueError(f"입력 텐서 형태가 예상과 다릅니다: {x.shape}")
-        else:
-            raise ValueError(f"입력 텐서는 3차원이어야 합니다: {x.shape}")
+        return self.model(x)
+
+# class EdgeEncoder_SGPN(nn.Module):
+#     def __init__(self, cfg, device):
+#         super().__init__()
+#         self._device = device
+#         self.cfg = cfg
+
+#         # 입력 차원 설정
+#         dim_pts = 3
+#         if cfg.model.use_rgb:
+#             dim_pts += 3
+#         if cfg.model.use_normal:
+#             dim_pts += 3
+#         self.dim_pts = dim_pts + 1  # 마스크 포함
         
-        # 배치 크기가 1인 경우 평가 모드로 전환
-        if batch_size == 1:
-            # 배치 크기 1일 때 BatchNorm 문제 방지
-            was_training = self.training
-            self.eval()  # 평가 모드로 전환
-            
-            # 인스턴스 스테이지 통과
-            instance_features = self.instance_stage(x)  # [B, 256, N]
-            
-            # 인스턴스 스테이지 다운샘플링 (16배)
-            if num_points >= self.instance_downsample:
-                instance_points = num_points // self.instance_downsample
-                instance_features = self.downsample_features(instance_features, instance_points)  # [B, 256, N/16]
-            
-            # 관계 스테이지 통과
-            relation_features = self.relation_stage(instance_features)  # [B, edge_feature_dim, N/16]
-            
-            # 관계 스테이지 다운샘플링 (4배)
-            if num_points >= (self.instance_downsample * self.relation_downsample):
-                relation_points = num_points // (self.instance_downsample * self.relation_downsample)
-                relation_features = self.downsample_features(relation_features, relation_points)  # [B, edge_feature_dim, N/64]
-            
-            # 원래 모드로 복원
-            if was_training:
-                self.train()
-        else:
-            # 배치 크기가 1보다 큰 경우 정상 처리
-            # 인스턴스 스테이지 통과
-            instance_features = self.instance_stage(x)  # [B, 256, N]
-            
-            # 인스턴스 스테이지 다운샘플링 (16배)
-            if num_points >= self.instance_downsample:
-                instance_points = num_points // self.instance_downsample
-                instance_features = self.downsample_features(instance_features, instance_points)  # [B, 256, N/16]
-            
-            # 관계 스테이지 통과
-            relation_features = self.relation_stage(instance_features)  # [B, edge_feature_dim, N/16]
-            
-            # 관계 스테이지 다운샘플링 (4배)
-            if num_points >= (self.instance_downsample * self.relation_downsample):
-                relation_points = num_points // (self.instance_downsample * self.relation_downsample)
-                relation_features = self.downsample_features(relation_features, relation_points)  # [B, edge_feature_dim, N/64]
+#         # HDSN의 계층적 구조
+#         # 인스턴스 스테이지: 더 세밀한 특징 추출
+#         self.instance_stage = nn.Sequential(
+#             nn.Conv1d(self.dim_pts, 64, 1),
+#             nn.BatchNorm1d(64, track_running_stats=True, momentum=0.01),
+#             nn.ReLU(),
+#             nn.Conv1d(64, 128, 1),
+#             nn.BatchNorm1d(128, track_running_stats=True, momentum=0.01),
+#             nn.ReLU(),
+#             nn.Conv1d(128, 256, 1),
+#             nn.BatchNorm1d(256, track_running_stats=True, momentum=0.01),
+#             nn.ReLU()
+#         )
         
-        # 전역 특징 추출 (최대 풀링)
-        global_feature = torch.max(relation_features, dim=2)[0]  # [B, edge_feature_dim]
-        global_feature = self.global_feat(global_feature)
+#         # 관계 스테이지: 더 넓은 문맥 특징 추출
+#         self.relation_stage = nn.Sequential(
+#             nn.Conv1d(256, 512, 1),
+#             nn.BatchNorm1d(512, track_running_stats=True, momentum=0.01),
+#             nn.ReLU(),
+#             nn.Conv1d(512, cfg.model.edge_feature_dim, 1),
+#             nn.BatchNorm1d(cfg.model.edge_feature_dim, track_running_stats=True, momentum=0.01),
+#             nn.ReLU()
+#         )
         
-        return global_feature
+#         # 계층적 다운샘플링 적용 (인스턴스 스테이지 16배, 관계 스테이지 4배)
+#         self.instance_downsample = 16
+#         self.relation_downsample = 4
+        
+#         # 최종 특징 통합 (배치 크기 1 대응을 위해 BatchNorm 대신 LayerNorm 사용)
+#         self.global_feat = nn.Sequential(
+#             nn.Linear(cfg.model.edge_feature_dim, cfg.model.edge_feature_dim),
+#             nn.LayerNorm(cfg.model.edge_feature_dim),  # BatchNorm1d 대신 LayerNorm 사용
+#             nn.ReLU()
+#         )
+
+#     def forward(self, x):
+#         """
+#         x: 입력 포인트 클라우드 (형태 자동 감지)
+#         """
+#         # 입력 텐서 형태 확인 및 조정
+#         if len(x.shape) == 3:
+#             if x.shape[1] == self.dim_pts and x.shape[2] > self.dim_pts:
+#                 # 이미 [B, C, N] 형태인 경우
+#                 batch_size, channels, num_points = x.shape
+#             elif x.shape[2] == self.dim_pts and x.shape[1] > self.dim_pts:
+#                 # [B, N, C] 형태인 경우 -> [B, C, N]으로 변환
+#                 x = x.transpose(1, 2).contiguous()
+#                 batch_size, channels, num_points = x.shape
+#             else:
+#                 # 차원 불명확한 경우
+#                 raise ValueError(f"입력 텐서 형태가 예상과 다릅니다: {x.shape}")
+#         else:
+#             raise ValueError(f"입력 텐서는 3차원이어야 합니다: {x.shape}")
+        
+#         # 배치 크기가 1인 경우 평가 모드로 전환
+#         if batch_size == 1:
+#             # 배치 크기 1일 때 BatchNorm 문제 방지
+#             was_training = self.training
+#             self.eval()  # 평가 모드로 전환
+            
+#             # 인스턴스 스테이지 통과
+#             instance_features = self.instance_stage(x)  # [B, 256, N]
+            
+#             # 인스턴스 스테이지 다운샘플링 (16배)
+#             if num_points >= self.instance_downsample:
+#                 instance_points = num_points // self.instance_downsample
+#                 instance_features = self.downsample_features(instance_features, instance_points)  # [B, 256, N/16]
+            
+#             # 관계 스테이지 통과
+#             relation_features = self.relation_stage(instance_features)  # [B, edge_feature_dim, N/16]
+            
+#             # 관계 스테이지 다운샘플링 (4배)
+#             if num_points >= (self.instance_downsample * self.relation_downsample):
+#                 relation_points = num_points // (self.instance_downsample * self.relation_downsample)
+#                 relation_features = self.downsample_features(relation_features, relation_points)  # [B, edge_feature_dim, N/64]
+            
+#             # 원래 모드로 복원
+#             if was_training:
+#                 self.train()
+#         else:
+#             # 배치 크기가 1보다 큰 경우 정상 처리
+#             # 인스턴스 스테이지 통과
+#             instance_features = self.instance_stage(x)  # [B, 256, N]
+            
+#             # 인스턴스 스테이지 다운샘플링 (16배)
+#             if num_points >= self.instance_downsample:
+#                 instance_points = num_points // self.instance_downsample
+#                 instance_features = self.downsample_features(instance_features, instance_points)  # [B, 256, N/16]
+            
+#             # 관계 스테이지 통과
+#             relation_features = self.relation_stage(instance_features)  # [B, edge_feature_dim, N/16]
+            
+#             # 관계 스테이지 다운샘플링 (4배)
+#             if num_points >= (self.instance_downsample * self.relation_downsample):
+#                 relation_points = num_points // (self.instance_downsample * self.relation_downsample)
+#                 relation_features = self.downsample_features(relation_features, relation_points)  # [B, edge_feature_dim, N/64]
+        
+#         # 전역 특징 추출 (최대 풀링)
+#         global_feature = torch.max(relation_features, dim=2)[0]  # [B, edge_feature_dim]
+#         global_feature = self.global_feat(global_feature)
+        
+#         return global_feature
     
-    def downsample_features(self, features, target_points):
-        """
-        특징 맵 다운샘플링 (단순 스트라이드 풀링)
-        features: [B, C, N] 형태의 특징 맵
-        target_points: 목표 포인트 수
-        """
-        batch_size, channels, num_points = features.shape
+#     def downsample_features(self, features, target_points):
+#         """
+#         특징 맵 다운샘플링 (단순 스트라이드 풀링)
+#         features: [B, C, N] 형태의 특징 맵
+#         target_points: 목표 포인트 수
+#         """
+#         batch_size, channels, num_points = features.shape
         
-        # 최소 1개 포인트 보장
-        target_points = max(1, target_points)
+#         # 최소 1개 포인트 보장
+#         target_points = max(1, target_points)
         
-        # 현재 포인트 수가 목표보다 적으면 그대로 반환
-        if num_points <= target_points:
-            return features
+#         # 현재 포인트 수가 목표보다 적으면 그대로 반환
+#         if num_points <= target_points:
+#             return features
         
-        # 단순 스트라이드 풀링 (균등 간격 샘플링)
-        stride = num_points // target_points
-        indices = torch.arange(0, target_points, device=features.device) * stride
-        indices = torch.clamp(indices, 0, num_points - 1)  # 인덱스 범위 안전하게 조정
-        return features[:, :, indices]
+#         # 단순 스트라이드 풀링 (균등 간격 샘플링)
+#         stride = num_points // target_points
+#         indices = torch.arange(0, target_points, device=features.device) * stride
+#         indices = torch.clamp(indices, 0, num_points - 1)  # 인덱스 범위 안전하게 조정
+#         return features[:, :, indices]
