@@ -487,7 +487,6 @@ class MSG_FAN_Masking(MessagePassing):
                  aggr='max',
                  attn_dropout: float = 0.5,
                  node_mask_prob: float = 0.3,
-                 edge_mask_prob: float = 0.3,
                  flow: str = 'target_to_source'):
         super().__init__(aggr=aggr, flow=flow)
         assert dim_node % num_heads == 0
@@ -500,7 +499,6 @@ class MSG_FAN_Masking(MessagePassing):
         self.temperature = math.sqrt(self.dim_edge_proj)
         
         self.node_mask_prob = node_mask_prob
-        self.edge_mask_prob = edge_mask_prob
 
         self.nn_att = MLP([self.dim_node_proj+self.dim_edge_proj, self.dim_node_proj+self.dim_edge_proj,
                            self.dim_edge_proj])
@@ -531,46 +529,20 @@ class MSG_FAN_Masking(MessagePassing):
             return self.propagate_without_masking(edge_index, x=x, edge_feature=edge_feature, x_ori=x)
     
     def propagate_with_masking(self, edge_index, **kwargs):
-        num_edges = edge_index.size(1)
-        edge_mask = torch.rand(num_edges, device=edge_index.device) >= self.edge_mask_prob
-        
-        masked_edge_index = edge_index[:, edge_mask]
-        
         x = kwargs.get('x')
         edge_feature = kwargs.get('edge_feature')
         x_ori = kwargs.get('x_ori')
         
-        if edge_feature is not None:
-            if edge_feature.shape[0] != num_edges:
-                print(f"Warning: edge_feature shape[0] {edge_feature.shape[0]} != edge_index shape[1] {num_edges}")
-                min_size = min(edge_feature.shape[0], num_edges)
-                edge_feature = edge_feature[:min_size]
-                edge_mask = edge_mask[:min_size]
-            
-            masked_edge_feature = edge_feature[edge_mask]
-            kwargs['edge_feature'] = masked_edge_feature
+        num_nodes = x.size(0)
+        node_mask = torch.rand(num_nodes, device=edge_index.device) >= self.node_mask_prob
         
-        if edge_mask.sum() > 0:  # 남은 edge가 있는 경우
-            src_nodes = masked_edge_index[0]
-            dst_nodes = masked_edge_index[1]
-            
-            src_node_mask = torch.rand(src_nodes.size(0), device=edge_index.device) >= self.node_mask_prob
-            dst_node_mask = torch.rand(dst_nodes.size(0), device=edge_index.device) >= self.node_mask_prob
-            
-            if x is not None:
-                masked_x = x.clone()
-                
-                masked_src_nodes = src_nodes[~src_node_mask]
-                masked_dst_nodes = dst_nodes[~dst_node_mask]
-                
-                masked_x[masked_src_nodes] = 0
-                masked_x[masked_dst_nodes] = 0
-                
-                kwargs['x'] = masked_x
+        masked_x = x.clone()
+        masked_x[~node_mask] = 0 
+        kwargs['x'] = masked_x
         
-        result = super().propagate(masked_edge_index, **kwargs)
+        result = super().propagate(edge_index, **kwargs)
         
-        return result[0], result[1], masked_edge_index, result[2]
+        return result[0], result[1], edge_index, result[2]
     
     def propagate_without_masking(self, edge_index, **kwargs):
         result = super().propagate(edge_index, **kwargs)
@@ -935,7 +907,7 @@ class GraphEdgeAttenNetworkLayers_edge_update(torch.nn.Module):
         return node_feature, edge_feature, probs
     
 class GraphEdgeAttenNetworkLayers_masking(torch.nn.Module):
-    """ A sequence of scene graph convolution layers with node and edge masking """
+    """ A sequence of scene graph convolution layers with node masking only """
 
     def __init__(self, **kwargs):
         super().__init__()
@@ -947,7 +919,6 @@ class GraphEdgeAttenNetworkLayers_masking(torch.nn.Module):
             self.drop_out = torch.nn.Dropout(kwargs['DROP_OUT_ATTEN'])
 
         node_mask_prob = kwargs.get('node_mask_prob', 0.3)
-        edge_mask_prob = kwargs.get('edge_mask_prob', 0.3)
         
         for _ in range(self.num_layers):
             self.gconvs.append(MSG_FAN_Masking(
@@ -959,7 +930,6 @@ class GraphEdgeAttenNetworkLayers_masking(torch.nn.Module):
                 aggr=kwargs['aggr'],
                 attn_dropout=kwargs.get('attn_dropout', 0.1),
                 node_mask_prob=node_mask_prob,
-                edge_mask_prob=edge_mask_prob,
                 flow=kwargs.get('flow', 'target_to_source')
             ))
 
@@ -969,22 +939,15 @@ class GraphEdgeAttenNetworkLayers_masking(torch.nn.Module):
         edge_feature = data['node', 'to', 'node'].x
         edges_indices = data['node', 'to', 'node'].edge_index
         
-        original_edge_indices = edges_indices.clone()
-        original_edge_feature = edge_feature.clone()
-        
-        if self.training:
-            data['_original_edge_indices'] = original_edge_indices
-            data['_original_edge_feature'] = original_edge_feature
-        
         for i in range(self.num_layers):
             gconv = self.gconvs[i]
             
             if self.training:
-                # 학습
+                # Training with node masking
                 node_feature, edge_feature, edges_indices, prob = gconv(
                     node_feature, edge_feature, edges_indices)
             else:
-                # 추론
+                # Inference without masking
                 node_feature, edge_feature, prob = gconv.propagate_without_masking(
                     edges_indices, x=node_feature, edge_feature=edge_feature, x_ori=node_feature)
 
