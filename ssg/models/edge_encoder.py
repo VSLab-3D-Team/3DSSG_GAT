@@ -8,8 +8,6 @@ import inspect
 from collections import OrderedDict
 
 import torch.nn.functional as F
-import numpy as np
-from typing import List, Tuple
 
 
 class EdgeDescriptor_8(MessagePassing):
@@ -399,10 +397,17 @@ class EdgeEncoder_SGPN(nn.Module):
         )
 
     def forward(self, x):
-
-        batch_size, num_points, _ = x.shape
-        
-        x = x.transpose(1, 2).contiguous()
+  
+        if len(x.shape) == 3:
+            if x.shape[1] == self.dim_pts and x.shape[2] > self.dim_pts:
+                batch_size, channels, num_points = x.shape
+            elif x.shape[2] == self.dim_pts and x.shape[1] > self.dim_pts:
+                x = x.transpose(1, 2).contiguous()
+                batch_size, channels, num_points = x.shape
+            else:
+                raise ValueError(f"dimension unmatch: {x.shape}")
+        else:
+            raise ValueError(f"input tensor must be 3-dimension: {x.shape}")
         
         instance_features = self.instance_stage(x)  # [B, 256, N]
         
@@ -422,7 +427,7 @@ class EdgeEncoder_SGPN(nn.Module):
         return global_feature
     
     def downsample_features(self, features, target_points):
- 
+
         batch_size, channels, num_points = features.shape
         
         target_points = max(1, target_points)
@@ -432,4 +437,5 @@ class EdgeEncoder_SGPN(nn.Module):
         
         stride = num_points // target_points
         indices = torch.arange(0, target_points, device=features.device) * stride
+        indices = torch.clamp(indices, 0, num_points - 1)
         return features[:, :, indices]
