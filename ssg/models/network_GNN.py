@@ -595,7 +595,7 @@ class BidirectionalEdgeLayer(MessagePassing):
                  aggr='max',
                  attn_dropout: float = 0.3,
                  flow: str = 'target_to_source',
-                 use_distance_mask: bool = True):
+                 use_distance_mask: bool = False):
         super().__init__(aggr=aggr, flow=flow)
         assert dim_node % num_heads == 0
         assert dim_edge % num_heads == 0
