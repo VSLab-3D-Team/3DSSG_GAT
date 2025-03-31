@@ -591,10 +591,11 @@ class BidirectionalEdgeLayer(MessagePassing):
     def __init__(self,
                  dim_node: int, dim_edge: int, dim_atten: int,
                  num_heads: int,
-                 use_bn: bool,
+                 use_bn: bool = True,
                  aggr='max',
-                 attn_dropout: float = 0.5,
-                 flow: str = 'target_to_source'):
+                 attn_dropout: float = 0.3,
+                 flow: str = 'target_to_source',
+                 use_distance_mask: bool = True):
         super().__init__(aggr=aggr, flow=flow)
         assert dim_node % num_heads == 0
         assert dim_edge % num_heads == 0
@@ -607,13 +608,15 @@ class BidirectionalEdgeLayer(MessagePassing):
         self.dim_node = dim_node
         self.dim_edge = dim_edge
         self.dim_atten = dim_atten
+        self.use_distance_mask = use_distance_mask
 
         self.proj_q = build_mlp([dim_node, dim_node])
         self.proj_v = build_mlp([dim_node, dim_atten])
         
         self.proj_k = build_mlp([dim_edge, dim_edge])
         
-        # [v_i, e_ij, e_ji, v_j] -> e_ij^(l+1)
+        self.distance_mlp = build_mlp([4, 32, 1], do_bn=use_bn, on_last=False)
+        
         self.nn_edge_update = build_mlp([dim_node*2+dim_edge*2, dim_node+dim_edge*2, dim_edge],
                                        do_bn=use_bn, on_last=False)
         
@@ -631,7 +634,7 @@ class BidirectionalEdgeLayer(MessagePassing):
         
         self.sigmoid = torch.nn.Sigmoid()
 
-    def forward(self, x, edge_feature, edge_index):
+    def forward(self, x, edge_feature, edge_index, node_positions=None):
         row, col = edge_index
         
         edge_id_mapping = {}
@@ -645,8 +648,23 @@ class BidirectionalEdgeLayer(MessagePassing):
                 reverse_idx = edge_id_mapping[(j.item(), i.item())]
                 reverse_edge_feature[idx] = edge_feature[reverse_idx]
         
-        outgoing_edges = {}  # out edge {node_id: [(edge_idx, target_node), ...]}
-        incoming_edges = {}  # in edge {node_id: [(edge_idx, source_node), ...]}
+        distance_mask = None
+        if self.use_distance_mask and node_positions is not None:
+            distance_features = []
+            for i, j in zip(row, col):
+                i, j = i.item(), j.item()
+                pos_i, pos_j = node_positions[i], node_positions[j]
+                diff = pos_i - pos_j
+                dist = torch.norm(diff, p=2)
+                distance_features.append(torch.cat([diff, dist.unsqueeze(0)], dim=0))
+            
+            distance_features = torch.stack(distance_features)
+            
+            distance_mask = self.distance_mlp(distance_features)
+            distance_mask = self.sigmoid(distance_mask).squeeze(-1)
+        
+        outgoing_edges = {}
+        incoming_edges = {}
         
         for idx, (i, j) in enumerate(zip(row, col)):
             i, j = i.item(), j.item()
@@ -663,13 +681,13 @@ class BidirectionalEdgeLayer(MessagePassing):
             x=x, 
             edge_feature=edge_feature,
             reverse_edge_feature=reverse_edge_feature,
+            distance_mask=distance_mask,
             x_ori=x
         )
         
         twin_edge_attention = torch.zeros((x.size(0), self.dim_edge*2), device=x.device)
         
         for node_id in range(x.size(0)):
-            # out
             outgoing_feature = torch.zeros(self.dim_edge, device=x.device)
             if node_id in outgoing_edges:
                 for edge_idx, _ in outgoing_edges[node_id]:
@@ -677,7 +695,6 @@ class BidirectionalEdgeLayer(MessagePassing):
                 if len(outgoing_edges[node_id]) > 0:
                     outgoing_feature /= len(outgoing_edges[node_id])
             
-            # in
             incoming_feature = torch.zeros(self.dim_edge, device=x.device)
             if node_id in incoming_edges:
                 for edge_idx, _ in incoming_edges[node_id]:
@@ -690,23 +707,23 @@ class BidirectionalEdgeLayer(MessagePassing):
         edge_attention = self.edge_attention_mlp(twin_edge_attention)
         edge_attention = self.sigmoid(edge_attention)
         
-        # v_i^(l+1) = f(v_i^l) ⊙ β(A_ε)
         node_feature_nonlinear = torch.nn.functional.relu(updated_node)  # f(v_i^l)
         final_node = node_feature_nonlinear * edge_attention  # ⊙ β(A_ε)
         
         return final_node, updated_edge, prob
 
     def message(self, x_i: Tensor, x_j: Tensor, 
-                edge_feature: Tensor, reverse_edge_feature: Tensor) -> Tensor:
+                edge_feature: Tensor, reverse_edge_feature: Tensor,
+                distance_mask: Optional[Tensor] = None) -> Tensor:
         '''
         x_i: 소스 노드 특징 [N, D_N]
         x_j: 타겟 노드 특징 [N, D_N]
         edge_feature: 정방향 에지 특징 [N, D_E]
         reverse_edge_feature: 역방향 에지 특징 [N, D_E]
+        distance_mask: 거리 기반 마스킹 가중치 [N] (선택적)
         '''
         num_edge = x_i.size(0)
         
-        # e_ij^(l+1) = g_e([v_i^l, e_ij^l, e_ji^l, v_j^l])
         updated_edge = self.nn_edge_update(
             torch.cat([x_i, edge_feature, reverse_edge_feature, x_j], dim=1)
         )
@@ -718,6 +735,11 @@ class BidirectionalEdgeLayer(MessagePassing):
         x_j_val = self.proj_v(x_j)
         
         att = self.nn_att(torch.cat([x_i_proj, edge_proj], dim=1))  # [N, D, H]
+        
+        if distance_mask is not None:
+            distance_mask = distance_mask.view(-1, 1, 1)
+            att = att * distance_mask
+        
         prob = torch.nn.functional.softmax(att/self.temperature, dim=1)
         prob = self.dropout(prob)
         
@@ -974,6 +996,7 @@ class BidirectionalEdgeGraphNetwork(torch.nn.Module):
     def __init__(self, **kwargs):
         super().__init__()
         self.num_layers = kwargs['num_layers']
+        self.use_distance_mask = kwargs.get('use_distance_mask', True)
 
         self.gconvs = torch.nn.ModuleList()
         self.drop_out = None
@@ -989,10 +1012,15 @@ class BidirectionalEdgeGraphNetwork(torch.nn.Module):
         edge_feature = data['node', 'to', 'node'].x
         edges_indices = data['node', 'to', 'node'].edge_index
         
+        node_positions = None
+        if self.use_distance_mask and 'desp' in data['node']:
+            node_positions = data['node'].desp[:, :3]
+        
         for i in range(self.num_layers):
             gconv = self.gconvs[i]
             node_feature, edge_feature, prob = gconv(
-                node_feature, edge_feature, edges_indices)
+                node_feature, edge_feature, edges_indices, node_positions
+            )
 
             if i < (self.num_layers-1) or self.num_layers == 1:
                 node_feature = torch.nn.functional.relu(node_feature)
