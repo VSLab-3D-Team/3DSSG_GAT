@@ -20,5 +20,6 @@ gnn_list = {
     'vgfm': TripletVGfM,
     'jointgnn': JointGNN,
     'fan_edge_update': GraphEdgeAttenNetworkLayers_edge_update,
-    'fan_masking': GraphEdgeAttenNetworkLayers_masking
+    'fan_masking': GraphEdgeAttenNetworkLayers_masking,
+    'bi_edge_update' : BidirectionalEdgeGraphNetwork
 }

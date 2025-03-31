@@ -19,7 +19,35 @@ from copy import deepcopy
 from torch_scatter import scatter
 from codeLib.common import filter_args_create
 import ssg
+import torch.nn.functional as F
 
+def build_mlp(dims, do_bn=True, on_last=True):
+    """Helper function to build an MLP with specified dimensions."""
+    layers = []
+    for i in range(len(dims) - 1):
+        layers.append(torch.nn.Linear(dims[i], dims[i + 1]))
+        if i < len(dims) - 2 or on_last:
+            if do_bn:
+                layers.append(torch.nn.BatchNorm1d(dims[i + 1]))
+            layers.append(torch.nn.ReLU())
+    return torch.nn.Sequential(*layers)
+
+class MLP(torch.nn.Module):
+    """Simple MLP class"""
+    def __init__(self, dims):
+        super().__init__()
+        self.layers = build_mlp(dims)
+    
+    def forward(self, x):
+        return self.layers(x)
+
+def filter_args_create(cls, kwargs):
+    """Helper to create a class instance with filtered arguments."""
+    import inspect
+    sig = inspect.signature(cls.__init__)
+    filter_keys = [param.name for param in sig.parameters.values() if param.name != 'self']
+    filtered_dict = {key: kwargs[key] for key in filter_keys if key in kwargs}
+    return cls(**filtered_dict)
 
 class TripletGCN(MessagePassing):
     def __init__(self, dim_node, dim_edge, dim_hidden, aggr='mean', with_bn=True):
@@ -612,6 +640,124 @@ class MSG_FAN_Masking(MessagePassing):
     def update(self, x, x_ori):
         x[0] = self.update_node(torch.cat([x_ori, x[0]], dim=1))
         return x
+    
+class BidirectionalEdgeLayer(MessagePassing):
+    def __init__(self,
+                 dim_node: int, dim_edge: int, dim_atten: int,
+                 num_heads: int,
+                 use_bn: bool,
+                 aggr='max',
+                 attn_dropout: float = 0.5,
+                 flow: str = 'target_to_source'):
+        super().__init__(aggr=aggr, flow=flow)
+        assert dim_node % num_heads == 0
+        assert dim_edge % num_heads == 0
+        assert dim_atten % num_heads == 0
+        self.dim_node_proj = dim_node // num_heads
+        self.dim_edge_proj = dim_edge // num_heads
+        self.dim_value_proj = dim_atten // num_heads
+        self.num_head = num_heads
+        self.temperature = math.sqrt(self.dim_edge_proj)
+
+        self.distance_mlp = build_mlp([3 + 1, dim_node//2, dim_node//4], do_bn=use_bn)
+        
+        self.mhsa = nn.MultiheadAttention(dim_node, num_heads, dropout=attn_dropout)
+        
+        self.edge_transform = build_mlp([dim_edge, dim_edge], do_bn=use_bn)
+        
+        self.update_node = build_mlp([dim_node + dim_edge, dim_node], do_bn=use_bn, on_last=False)
+        
+        self.update_edge = build_mlp([dim_node*2 + dim_edge*2, dim_edge], do_bn=use_bn, on_last=False)
+        
+        self.dropout = nn.Dropout(attn_dropout) if attn_dropout > 0 else nn.Identity()
+
+    def forward(self, x, edge_feature, edge_index, node_pos=None):
+        """
+        x: 노드 특징 [num_nodes, dim_node]
+        edge_feature: 에지 특징 [num_edges, dim_edge]
+        edge_index: 에지 인덱스 [2, num_edges]
+        node_pos: 노드의 3D 위치 [num_nodes, 3] (거리 기반 마스킹에 사용)
+        """
+        edge_dict = {}
+        for i in range(edge_index.size(1)):
+            src, dst = edge_index[0, i].item(), edge_index[1, i].item()
+            edge_dict[(src, dst)] = i
+        
+        reverse_edge_feature = torch.zeros_like(edge_feature)
+        for i in range(edge_index.size(1)):
+            src, dst = edge_index[0, i].item(), edge_index[1, i].item()
+            if (dst, src) in edge_dict:
+                reverse_idx = edge_dict[(dst, src)]
+                reverse_edge_feature[i] = edge_feature[reverse_idx]
+        
+        attn_mask = None
+        if node_pos is not None:
+            attn_mask = self._create_distance_mask(node_pos, edge_index)
+        
+        x_mhsa = x.unsqueeze(1)  # [num_nodes, 1, dim_node]
+        x_updated, _ = self.mhsa(x_mhsa, x_mhsa, x_mhsa, attn_mask=attn_mask)
+        x_updated = x_updated.squeeze(1)  # [num_nodes, dim_node]
+        
+        edge_updated, twinning_edge_attn = self.propagate(
+            edge_index, 
+            x=x, 
+            edge_feature=edge_feature, 
+            reverse_edge_feature=reverse_edge_feature
+        )
+        
+        final_node_feature = self.update_node(torch.cat([x_updated, twinning_edge_attn], dim=1))
+        
+        return final_node_feature, edge_updated
+    
+    def _create_distance_mask(self, node_pos, edge_index):
+        """
+        노드 간 거리를 기반으로 attention 마스크 생성
+        """
+        num_nodes = node_pos.size(0)
+        mask = torch.ones(num_nodes, num_nodes, device=node_pos.device) * float('-inf')
+        
+        for i in range(edge_index.size(1)):
+            src, dst = edge_index[0, i], edge_index[1, i]
+            
+            dist = torch.norm(node_pos[src] - node_pos[dst], p=2)
+            
+            weight = 1.0 / (dist + 1e-6)
+            
+            mask[src, dst] = weight
+            mask[dst, src] = weight  # 양방향
+        
+        for i in range(num_nodes):
+            mask[i, i] = 1.0
+            
+        return mask
+
+    def message(self, x_i, x_j, edge_feature, reverse_edge_feature):
+        """
+        x_i: 소스 노드 특징 [num_edges, dim_node]
+        x_j: 타겟 노드 특징 [num_edges, dim_node]
+        edge_feature: 에지 특징 [num_edges, dim_edge]
+        reverse_edge_feature: 역방향 에지 특징 [num_edges, dim_edge]
+        """
+        # e_{ij}^{l+1} = g_e([v_i^l, e_{ij}^l, e_{ji}^l, v_j^l])
+        updated_edge = self.update_edge(
+            torch.cat([x_i, edge_feature, reverse_edge_feature, x_j], dim=1)
+        )
+        
+        transformed_edge = self.edge_transform(edge_feature)
+        
+        return updated_edge, transformed_edge
+
+    def aggregate(self, inputs, index, dim_size=None):
+
+        updated_edge, transformed_edge = inputs
+        
+        subj_edge_features = scatter(transformed_edge, index[0], dim=0, dim_size=dim_size, reduce=self.aggr)
+        
+        obj_edge_features = scatter(transformed_edge, index[1], dim=0, dim_size=dim_size, reduce=self.aggr)
+        
+        twinning_edge_attn = subj_edge_features + obj_edge_features
+        
+        return updated_edge, twinning_edge_attn
 
 class JointGNN(torch.nn.Module):
     def __init__(self, **kwargs):
@@ -849,6 +995,60 @@ class GraphEdgeAttenNetworkLayers_masking(torch.nn.Module):
                 probs.append(None)
         
         return node_feature, edge_feature, probs
+    
+class BidirectionalEdgeGraphNetwork(torch.nn.Module):
+    
+    def __init__(self, **kwargs):
+        super().__init__()
+        self.num_layers = kwargs['num_layers']
+        self.dim_node = kwargs['dim_node']
+        self.dim_edge = kwargs['dim_edge']
+        self.dim_atten = kwargs['dim_atten']
+        self.num_heads = kwargs['num_heads']
+        self.use_bn = kwargs.get('use_bn', True)
+        self.aggr = kwargs.get('aggr', 'max')
+        self.attn_dropout = kwargs.get('attn_dropout', 0.1)
+        
+        self.gconvs = torch.nn.ModuleList()
+        self.drop_out = None
+        if 'DROP_OUT_ATTEN' in kwargs:
+            self.drop_out = torch.nn.Dropout(kwargs['DROP_OUT_ATTEN'])
+        
+        for _ in range(self.num_layers):
+            self.gconvs.append(BidirectionalEdgeLayer(
+                dim_node=self.dim_node,
+                dim_edge=self.dim_edge,
+                dim_atten=self.dim_atten,
+                num_heads=self.num_heads,
+                use_bn=self.use_bn,
+                aggr=self.aggr,
+                attn_dropout=self.attn_dropout
+            ))
+    
+    def forward(self, data):
+
+        node_feature = data['node'].x
+        edge_feature = data['node', 'to', 'node'].x
+        edges_indices = data['node', 'to', 'node'].edge_index
+        
+        node_pos = data['node'].pos if 'pos' in data['node'] else None
+        
+        for i in range(self.num_layers):
+            gconv = self.gconvs[i]
+            
+            node_feature, edge_feature = gconv(
+                node_feature, edge_feature, edges_indices, node_pos
+            )
+            
+            if i < (self.num_layers-1) or self.num_layers == 1:
+                node_feature = F.relu(node_feature)
+                edge_feature = F.relu(edge_feature)
+                
+                if self.drop_out:
+                    node_feature = self.drop_out(node_feature)
+                    edge_feature = self.drop_out(edge_feature)
+        
+        return node_feature, edge_feature, None  # None은 probs 자리
 
 
 class FAN_GRU(torch.nn.Module):
