@@ -99,8 +99,39 @@ class SGPN(nn.Module):
             if has_edge and self.cfg.model.gnn.num_layers > 0:
                 gcn_obj_feature, gcn_rel_feature = self.gnn(
                     data['node'].x, data['node', 'to', 'node'].x, node_edges)
-                data['node'].x = gcn_obj_feature
+                if self.cfg.model.gnn.node_from_gnn:
+                    data['node'].x = gcn_obj_feature
                 data['node', 'to', 'node'].x = gcn_rel_feature
+        elif self.cfg.model.gnn.method == "mman" or "mman_edge_update":
+            probs_3d = None
+            probs_text = None
+            kl_divs = None
+            if has_edge:
+                ''' GNN '''
+                node_feature_ori = None
+                if not self.cfg.model.gnn.node_from_gnn:
+                    node_feature_ori = data['node'].x
+                if hasattr(self, 'gnn') and self.gnn is not None:
+                    gnn_nodes_feature, gnn_edges_feature, probs_3d, probs_text, kl_divs = \
+                        self.gnn(data)
+
+                    data['node'].x = gnn_nodes_feature
+                    data['node', 'to', 'node'].x = gnn_edges_feature
+                if not self.cfg.model.gnn.node_from_gnn:
+                    data['node'].x = node_feature_ori
+                    
+            '''Classification'''
+            # Node
+            node_cls = self.obj_predictor(data['node'].x)
+            # Edge
+            if has_edge:
+                edge_cls = self.rel_predictor(data['node', 'to', 'node'].x)
+            else:
+                edge_cls = None
+            if kl_divs != None:
+                return node_cls, edge_cls, kl_divs
+            else:
+                return node_cls, edge_cls
         else:
             if has_edge:
                 ''' GNN '''

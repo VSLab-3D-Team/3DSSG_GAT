@@ -22,29 +22,30 @@ logger_py = logging.getLogger(__name__)
 def main():
     cfg = ssg.Parse()
 
-    current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-    original_name = cfg.name
-    time_stamped_name = f"{original_name}_{current_time}"
-
-    cfg.name = time_stamped_name
-
-    # Shorthands
-    out_dir = os.path.join(cfg['training']['out_dir'], cfg.name)
-
-    # set random seed
-    codeLib.utils.util.set_random_seed(cfg.SEED)
-
-    # Output directory
-    if not os.path.exists(out_dir):
-        os.makedirs(out_dir)
-
-    # Log
-    logging.basicConfig(filename=os.path.join(
-        out_dir, 'log'), level=cfg.log_level)
-    logger_py.setLevel(cfg.log_level)
-
     if cfg.MODE == 'train':
+        
+        current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        original_name = cfg.name
+        time_stamped_name = f"{original_name}_{current_time}"
+
+        cfg.name = time_stamped_name
+
+        # Shorthands
+        out_dir = os.path.join(cfg['training']['out_dir'], cfg.name)
+
+        # set random seed
+        codeLib.utils.util.set_random_seed(cfg.SEED)
+
+        # Output directory
+        if not os.path.exists(out_dir):
+            os.makedirs(out_dir)
+
+        # Log
+        logging.basicConfig(filename=os.path.join(
+            out_dir, 'log'), level=cfg.log_level)
+        logger_py.setLevel(cfg.log_level)
+        
         logger_py.info('train')
         n_workers = cfg['training']['data_workers']
 
@@ -123,6 +124,21 @@ def main():
         '''use CPU for memory issue'''
         # cfg.DEVICE = torch.device("cpu")
 
+        # Shorthands
+        out_dir = os.path.join(cfg['training']['out_dir'], cfg.name)
+
+        # set random seed
+        codeLib.utils.util.set_random_seed(cfg.SEED)
+
+        # Output directory
+        if not os.path.exists(out_dir):
+            os.makedirs(out_dir)
+
+        # Log
+        logging.basicConfig(filename=os.path.join(
+            out_dir, 'log'), level=cfg.log_level)
+        logger_py.setLevel(cfg.log_level)
+        
         cfg.data.load_cache = False
         eval_mode = cfg.eval.mode
         assert eval_mode in ['segment', 'instance']

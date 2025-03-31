@@ -15,6 +15,7 @@ logger_py = logging.getLogger(__name__)
 
 method_dict = {
     'sgfn': SGFN,
+    'mman': SGPN,
     'sgpn': SGPN,
     'imp': IMP,
     'jointsg': JointSG,
@@ -108,6 +109,29 @@ def get_model(cfg, num_obj_cls, num_rel_cls):
             num_obj_cls=num_obj_cls,
             num_rel_cls=num_rel_cls,
             device=cfg.DEVICE).to(cfg.DEVICE)
+    elif cfg.model.method == 'mman':
+        dataset = get_dataset(cfg, 'train')
+        
+        model = method_dict[cfg.model.method](
+            cfg=cfg,
+            num_obj_cls=num_obj_cls,
+            num_rel_cls=num_rel_cls,
+            device=cfg.DEVICE).to(cfg.DEVICE)
+        
+        if hasattr(model.gnn, 'node_class_names'):
+            model.gnn.node_class_names = dataset.classNames
+            model.gnn.edge_class_names = dataset.relationNames
+            
+            if hasattr(model.gnn, 'gconvs'):
+                for gconv in model.gnn.gconvs:
+                    if hasattr(gconv, 'node_class_names'):
+                        gconv.node_class_names = dataset.classNames
+                        gconv.edge_class_names = dataset.relationNames
+                        
+                        if hasattr(gconv, 'clip_encoder'):
+                            gconv.clip_encoder.device = cfg.DEVICE
+        
+        return model
 
     node_encoder = get_node_encoder(cfg, cfg.DEVICE)
     edge_encoder = get_edge_encoder(cfg, cfg.DEVICE)

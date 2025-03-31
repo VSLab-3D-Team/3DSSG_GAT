@@ -1,0 +1,28 @@
+model:
+ method: sgpn
+ multi_rel: true # multiple relationship 
+ use_rgb: false
+ use_normal: false
+ use_spatial: false
+ img_feature_dim: 256
+ num_points_union: 512 # for 3DSSG
+ node_feature_dim: 256
+ edge_feature_dim: 256
+ gnn:
+  method: fan # [none, fan, triplet, mman, mman_edge_update]
+  hidden_dim: 256
+  num_layers: 2
+  num_heads: 8
+  drop_out: 0.3
+  node_from_gnn: true
+#  node_classifier:
+#   with_bn: false
+#   dropout: 0.3
+training:
+  lambda_attn_reg: 1
+data:
+  load_images: false
+  load_points: true
+  rel_data_type: points
+  use_precompute_img_feature: true
+  edge_desc: 'pts' # [roi,pts]
