@@ -377,11 +377,6 @@ class SetAbstraction(nn.Module):
         xyz: 입력 포인트 클라우드 좌표 [B, N, 3]
         points: 입력 포인트 특징 [B, N, C]
         """
-        if points is not None:
-            points = points.permute(0, 2, 1)  # [B, C, N]
-        
-        xyz = xyz.permute(0, 2, 1)  # [B, 3, N]
-        
         if self.group_all:
             new_xyz, new_points = self.sample_and_group_all(xyz, points)
         else:
@@ -391,54 +386,52 @@ class SetAbstraction(nn.Module):
             bn = self.mlp_bns[i]
             new_points = F.relu(bn(conv(new_points)))
         
-        new_points = torch.max(new_points, 2)[0]  # [B, D, npoint]
+        new_points = torch.max(new_points, dim=3)[0]  # [B, D, npoint]
         
-        new_xyz = new_xyz.permute(0, 2, 1)  # [B, npoint, 3]
-        new_points = new_points.permute(0, 2, 1)  # [B, npoint, D]
+        new_points = new_points.transpose(1, 2)  # [B, npoint, D]
         
         return new_xyz, new_points
     
     def sample_and_group_all(self, xyz, points):
-        """
-        전체 포인트 클라우드를 하나의 그룹으로 처리
-        """
-        batch_size, _, num_points = xyz.shape
+
+        batch_size, num_points, _ = xyz.shape
         device = xyz.device
         
-        new_xyz = torch.zeros(batch_size, 3, 1, device=device)
+        new_xyz = torch.zeros(batch_size, 1, 3, device=device)
         
-        grouped_xyz = xyz.view(batch_size, 3, 1, num_points) - new_xyz.view(batch_size, 3, 1, 1)
+        grouped_xyz = xyz.view(batch_size, 1, num_points, 3)
         
         if points is not None:
-            grouped_points = torch.cat([grouped_xyz, points.view(batch_size, -1, 1, num_points)], dim=1)
+            grouped_points = points.view(batch_size, 1, num_points, -1)
+            grouped_points = torch.cat([grouped_xyz, grouped_points], dim=-1)
         else:
             grouped_points = grouped_xyz
+        
+        grouped_points = grouped_points.permute(0, 3, 1, 2)  # [B, C, 1, N]
         
         return new_xyz, grouped_points
     
     def sample_and_group(self, xyz, points, ratio, radius, nsample):
-        """
-        FPS로 샘플링 후 Ball Query로 그룹화
-        """
-        batch_size, _, num_points = xyz.shape
+
+        batch_size, num_points, _ = xyz.shape
         device = xyz.device
         
-        npoint = int(num_points * ratio)
-        fps_idx = farthest_point_sample(xyz.permute(0, 2, 1).contiguous(), npoint)
-        new_xyz = index_points(xyz.permute(0, 2, 1), fps_idx)  # [B, npoint, 3]
-        new_xyz = new_xyz.permute(0, 2, 1)  # [B, 3, npoint]
+        npoint = max(1, int(num_points * ratio))
+        fps_idx = farthest_point_sample(xyz, npoint)
+        new_xyz = index_points(xyz, fps_idx)  # [B, npoint, 3]
         
-        idx = query_ball_point(radius, nsample, xyz.permute(0, 2, 1), new_xyz.permute(0, 2, 1))
-        grouped_xyz = index_points(xyz.permute(0, 2, 1), idx)  # [B, npoint, nsample, 3]
-        grouped_xyz -= new_xyz.permute(0, 2, 1).unsqueeze(2)
+        idx = query_ball_point(radius, nsample, xyz, new_xyz)
+        grouped_xyz = index_points(xyz, idx)  # [B, npoint, nsample, 3]
+        
+        grouped_xyz_norm = grouped_xyz - new_xyz.unsqueeze(2)
         
         if points is not None:
-            grouped_points = index_points(points.permute(0, 2, 1), idx)  # [B, npoint, nsample, C]
-            grouped_points = torch.cat([grouped_xyz, grouped_points], dim=-1)  # [B, npoint, nsample, 3+C]
+            grouped_points = index_points(points, idx)  # [B, npoint, nsample, C]
+            grouped_points = torch.cat([grouped_xyz_norm, grouped_points], dim=-1)
         else:
-            grouped_points = grouped_xyz
+            grouped_points = grouped_xyz_norm
         
-        grouped_points = grouped_points.permute(0, 3, 1, 2)  # [B, 3+C, npoint, nsample]
+        grouped_points = grouped_points.permute(0, 3, 1, 2)  # [B, C, npoint, nsample]
         
         return new_xyz, grouped_points
 
@@ -455,16 +448,18 @@ def farthest_point_sample(xyz, npoint):
     
     for i in range(npoint):
         centroids[:, i] = farthest
+        
         centroid = xyz[batch_indices, farthest, :].view(batch_size, 1, 3)
         
-        dist = torch.sum((xyz - centroid) ** 2, -1)
+        dist = torch.sum((xyz - centroid) ** 2, dim=2)
         
         mask = dist < distance
         distance[mask] = dist[mask]
         
-        farthest = torch.max(distance, -1)[1]
+        farthest = torch.max(distance, dim=1)[1]
     
     return centroids
+
 
 def index_points(points, idx):
 
@@ -490,13 +485,17 @@ def query_ball_point(radius, nsample, xyz, new_xyz):
     idx = torch.zeros(batch_size, npoint, nsample, dtype=torch.long, device=device)
     
     for b in range(batch_size):
-        dist = torch.sum((xyz[b:b+1, :, :] - new_xyz[b:b+1, :, :].transpose(1, 2)) ** 2, dim=-1)
+        centered_xyz = xyz[b].unsqueeze(0)  # (1, N, 3)
+        centered_new_xyz = new_xyz[b].unsqueeze(0)  # (1, M, 3)
         
-        _, idx_sorted = torch.sort(dist, dim=-1)
-        idx_sorted = idx_sorted[:, :nsample]
+        dist = torch.cdist(centered_new_xyz, centered_xyz, p=2)  # (1, M, N)
         
-        mask = dist[0, idx_sorted] > radius ** 2
-        idx_sorted[mask] = idx_sorted[0, 0]
+        _, idx_sorted = torch.sort(dist, dim=2)  # (1, M, N)
+        idx_sorted = idx_sorted[:, :, :nsample]  # (1, M, nsample)
+        
+        mask = dist.gather(2, idx_sorted) > radius
+        first_idx = idx_sorted[:, :, 0].unsqueeze(2).expand(-1, -1, nsample)
+        idx_sorted[mask] = first_idx[mask]
         
         idx[b] = idx_sorted[0]
     
@@ -515,7 +514,7 @@ class EdgeEncoder_SGPN(nn.Module):
             dim_pts += 3
         self.dim_pts = dim_pts + 1
         
-        # 인스턴스 스테이지: [1, 4, 4, 2] -> 총 16배 다운샘플링
+        # 인스턴스 스테이지: [1, 4, 2, 2] -> 총 16배 다운샘플링
         # 관계 스테이지: [2, 2] -> 추가 4배 다운샘플링 (총 64배)
         
         self.instance_stage = nn.ModuleList([
@@ -525,7 +524,7 @@ class EdgeEncoder_SGPN(nn.Module):
             SetAbstraction(ratio=0.25, radius=0.2, nsample=32, 
                            in_channel=64 + 3, mlp_list=[128, 128], group_all=False),
             
-            SetAbstraction(ratio=0.25, radius=0.4, nsample=32, 
+            SetAbstraction(ratio=0.5, radius=0.4, nsample=32, 
                            in_channel=128 + 3, mlp_list=[256, 256], group_all=False),
             
             SetAbstraction(ratio=0.5, radius=0.8, nsample=32, 
@@ -538,7 +537,7 @@ class EdgeEncoder_SGPN(nn.Module):
             
             SetAbstraction(ratio=0.5, radius=3.2, nsample=32, 
                            in_channel=512 + 3, mlp_list=[cfg.model.edge_feature_dim, cfg.model.edge_feature_dim], 
-                           group_all=False)
+                           group_all=True)
         ])
         
         self.global_feat = nn.Sequential(
@@ -548,9 +547,7 @@ class EdgeEncoder_SGPN(nn.Module):
         )
 
     def forward(self, x):
-        """
-        x: [B, N, C] 형태의 포인트 클라우드 (C = dim_pts)
-        """
+
         batch_size, num_points, _ = x.shape
         
         xyz = x[:, :, :3].contiguous()
@@ -565,11 +562,7 @@ class EdgeEncoder_SGPN(nn.Module):
             xyz, features = sa_module(xyz, features)
         
         if features.size(1) > 0:  # 포인트가 남아있는 경우
-            global_feature = torch.mean(features, dim=1)  # [B, D]
-            global_feature = self.global_feat(global_feature)
-            
-            # 필요시 원래 크기로 확장
-            # expanded_feature = global_feature.unsqueeze(1).expand(-1, num_points, -1)
+            global_feature = features.squeeze(1)  # [B, C]
             
             return global_feature
         else:
