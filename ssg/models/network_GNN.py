@@ -19,35 +19,6 @@ from copy import deepcopy
 from torch_scatter import scatter
 from codeLib.common import filter_args_create
 import ssg
-import torch.nn.functional as F
-
-def build_mlp(dims, do_bn=True, on_last=True):
-    """Helper function to build an MLP with specified dimensions."""
-    layers = []
-    for i in range(len(dims) - 1):
-        layers.append(torch.nn.Linear(dims[i], dims[i + 1]))
-        if i < len(dims) - 2 or on_last:
-            if do_bn:
-                layers.append(torch.nn.BatchNorm1d(dims[i + 1]))
-            layers.append(torch.nn.ReLU())
-    return torch.nn.Sequential(*layers)
-
-class MLP(torch.nn.Module):
-    """Simple MLP class"""
-    def __init__(self, dims):
-        super().__init__()
-        self.layers = build_mlp(dims)
-    
-    def forward(self, x):
-        return self.layers(x)
-
-def filter_args_create(cls, kwargs):
-    """Helper to create a class instance with filtered arguments."""
-    import inspect
-    sig = inspect.signature(cls.__init__)
-    filter_keys = [param.name for param in sig.parameters.values() if param.name != 'self']
-    filtered_dict = {key: kwargs[key] for key in filter_keys if key in kwargs}
-    return cls(**filtered_dict)
 
 class TripletGCN(MessagePassing):
     def __init__(self, dim_node, dim_edge, dim_hidden, aggr='mean', with_bn=True):
@@ -658,107 +629,143 @@ class BidirectionalEdgeLayer(MessagePassing):
         self.dim_value_proj = dim_atten // num_heads
         self.num_head = num_heads
         self.temperature = math.sqrt(self.dim_edge_proj)
+        self.dim_node = dim_node
+        self.dim_edge = dim_edge
+        self.dim_atten = dim_atten
 
-        self.distance_mlp = build_mlp([3 + 1, dim_node//2, dim_node//4], do_bn=use_bn)
+        self.proj_q = build_mlp([dim_node, dim_node])
+        self.proj_v = build_mlp([dim_node, dim_atten])
         
-        self.mhsa = nn.MultiheadAttention(dim_node, num_heads, dropout=attn_dropout)
+        self.proj_k = build_mlp([dim_edge, dim_edge])
         
-        self.edge_transform = build_mlp([dim_edge, dim_edge], do_bn=use_bn)
+        # [v_i, e_ij, e_ji, v_j] -> e_ij^(l+1)
+        self.nn_edge_update = build_mlp([dim_node*2+dim_edge*2, dim_node+dim_edge*2, dim_edge],
+                                       do_bn=use_bn, on_last=False)
         
-        self.update_node = build_mlp([dim_node + dim_edge, dim_node], do_bn=use_bn, on_last=False)
+        self.edge_attention_mlp = build_mlp([dim_edge*2, dim_edge], do_bn=use_bn, on_last=False)
         
-        self.update_edge = build_mlp([dim_node*2 + dim_edge*2, dim_edge], do_bn=use_bn, on_last=False)
+        self.nn_node_update = build_mlp([dim_node+dim_edge, dim_node+dim_edge, dim_node],
+                                       do_bn=use_bn, on_last=False)
         
-        self.dropout = nn.Dropout(attn_dropout) if attn_dropout > 0 else nn.Identity()
+        self.nn_att = MLP([self.dim_node_proj+self.dim_edge_proj, 
+                          self.dim_node_proj+self.dim_edge_proj,
+                          self.dim_edge_proj])
+        
+        self.dropout = torch.nn.Dropout(
+            attn_dropout) if attn_dropout > 0 else torch.nn.Identity()
+        
+        self.sigmoid = torch.nn.Sigmoid()
 
-    def forward(self, x, edge_feature, edge_index, node_pos=None):
-        """
-        x: 노드 특징 [num_nodes, dim_node]
-        edge_feature: 에지 특징 [num_edges, dim_edge]
-        edge_index: 에지 인덱스 [2, num_edges]
-        node_pos: 노드의 3D 위치 [num_nodes, 3] (거리 기반 마스킹에 사용)
-        """
-        edge_dict = {}
-        for i in range(edge_index.size(1)):
-            src, dst = edge_index[0, i].item(), edge_index[1, i].item()
-            edge_dict[(src, dst)] = i
+    def forward(self, x, edge_feature, edge_index):
+        row, col = edge_index
+        
+        edge_id_mapping = {}
+        for idx, (i, j) in enumerate(zip(row, col)):
+            edge_id_mapping[(i.item(), j.item())] = idx
         
         reverse_edge_feature = torch.zeros_like(edge_feature)
-        for i in range(edge_index.size(1)):
-            src, dst = edge_index[0, i].item(), edge_index[1, i].item()
-            if (dst, src) in edge_dict:
-                reverse_idx = edge_dict[(dst, src)]
-                reverse_edge_feature[i] = edge_feature[reverse_idx]
         
-        attn_mask = None
-        if node_pos is not None:
-            attn_mask = self._create_distance_mask(node_pos, edge_index)
+        for idx, (i, j) in enumerate(zip(row, col)):
+            if (j.item(), i.item()) in edge_id_mapping:
+                reverse_idx = edge_id_mapping[(j.item(), i.item())]
+                reverse_edge_feature[idx] = edge_feature[reverse_idx]
         
-        x_mhsa = x.unsqueeze(1)  # [num_nodes, 1, dim_node]
-        x_updated, _ = self.mhsa(x_mhsa, x_mhsa, x_mhsa, attn_mask=attn_mask)
-        x_updated = x_updated.squeeze(1)  # [num_nodes, dim_node]
+        outgoing_edges = {}  # out edge {node_id: [(edge_idx, target_node), ...]}
+        incoming_edges = {}  # in edge {node_id: [(edge_idx, source_node), ...]}
         
-        edge_updated, twinning_edge_attn = self.propagate(
+        for idx, (i, j) in enumerate(zip(row, col)):
+            i, j = i.item(), j.item()
+            if i not in outgoing_edges:
+                outgoing_edges[i] = []
+            outgoing_edges[i].append((idx, j))
+            
+            if j not in incoming_edges:
+                incoming_edges[j] = []
+            incoming_edges[j].append((idx, i))
+        
+        updated_node, updated_edge, prob = self.propagate(
             edge_index, 
             x=x, 
-            edge_feature=edge_feature, 
-            reverse_edge_feature=reverse_edge_feature
+            edge_feature=edge_feature,
+            reverse_edge_feature=reverse_edge_feature,
+            x_ori=x
         )
         
-        final_node_feature = self.update_node(torch.cat([x_updated, twinning_edge_attn], dim=1))
+        twin_edge_attention = torch.zeros((x.size(0), self.dim_edge*2), device=x.device)
         
-        return final_node_feature, edge_updated
-    
-    def _create_distance_mask(self, node_pos, edge_index):
-        """
-        노드 간 거리를 기반으로 attention 마스크 생성
-        """
-        num_nodes = node_pos.size(0)
-        mask = torch.ones(num_nodes, num_nodes, device=node_pos.device) * float('-inf')
+        for node_id in range(x.size(0)):
+            # out
+            outgoing_feature = torch.zeros(self.dim_edge, device=x.device)
+            if node_id in outgoing_edges:
+                for edge_idx, _ in outgoing_edges[node_id]:
+                    outgoing_feature += updated_edge[edge_idx]
+                if len(outgoing_edges[node_id]) > 0:
+                    outgoing_feature /= len(outgoing_edges[node_id])
+            
+            # in
+            incoming_feature = torch.zeros(self.dim_edge, device=x.device)
+            if node_id in incoming_edges:
+                for edge_idx, _ in incoming_edges[node_id]:
+                    incoming_feature += updated_edge[edge_idx]
+                if len(incoming_edges[node_id]) > 0:
+                    incoming_feature /= len(incoming_edges[node_id])
+            
+            twin_edge_attention[node_id] = torch.cat([outgoing_feature, incoming_feature], dim=0)
         
-        for i in range(edge_index.size(1)):
-            src, dst = edge_index[0, i], edge_index[1, i]
-            
-            dist = torch.norm(node_pos[src] - node_pos[dst], p=2)
-            
-            weight = 1.0 / (dist + 1e-6)
-            
-            mask[src, dst] = weight
-            mask[dst, src] = weight  # 양방향
+        edge_attention = self.edge_attention_mlp(twin_edge_attention)
+        edge_attention = self.sigmoid(edge_attention)
         
-        for i in range(num_nodes):
-            mask[i, i] = 1.0
-            
-        return mask
+        # v_i^(l+1) = f(v_i^l) ⊙ β(A_ε)
+        node_feature_nonlinear = torch.nn.functional.relu(updated_node)  # f(v_i^l)
+        final_node = node_feature_nonlinear * edge_attention  # ⊙ β(A_ε)
+        
+        return final_node, updated_edge, prob
 
-    def message(self, x_i, x_j, edge_feature, reverse_edge_feature):
-        """
-        x_i: 소스 노드 특징 [num_edges, dim_node]
-        x_j: 타겟 노드 특징 [num_edges, dim_node]
-        edge_feature: 에지 특징 [num_edges, dim_edge]
-        reverse_edge_feature: 역방향 에지 특징 [num_edges, dim_edge]
-        """
-        # e_{ij}^{l+1} = g_e([v_i^l, e_{ij}^l, e_{ji}^l, v_j^l])
-        updated_edge = self.update_edge(
+    def message(self, x_i: Tensor, x_j: Tensor, 
+                edge_feature: Tensor, reverse_edge_feature: Tensor) -> Tensor:
+        '''
+        x_i: 소스 노드 특징 [N, D_N]
+        x_j: 타겟 노드 특징 [N, D_N]
+        edge_feature: 정방향 에지 특징 [N, D_E]
+        reverse_edge_feature: 역방향 에지 특징 [N, D_E]
+        '''
+        num_edge = x_i.size(0)
+        
+        # e_ij^(l+1) = g_e([v_i^l, e_ij^l, e_ji^l, v_j^l])
+        updated_edge = self.nn_edge_update(
             torch.cat([x_i, edge_feature, reverse_edge_feature, x_j], dim=1)
         )
         
-        transformed_edge = self.edge_transform(edge_feature)
+        x_i_proj = self.proj_q(x_i).view(
+            num_edge, self.dim_node_proj, self.num_head)  # [N, D, H]
+        edge_proj = self.proj_k(edge_feature).view(
+            num_edge, self.dim_edge_proj, self.num_head)  # [N, D, H]
+        x_j_val = self.proj_v(x_j)
         
-        return updated_edge, transformed_edge
+        att = self.nn_att(torch.cat([x_i_proj, edge_proj], dim=1))  # [N, D, H]
+        prob = torch.nn.functional.softmax(att/self.temperature, dim=1)
+        prob = self.dropout(prob)
+        
+        weighted_value = prob.reshape_as(x_j_val) * x_j_val
+        
+        return [weighted_value, updated_edge, prob]
 
-    def aggregate(self, inputs, index, dim_size=None):
+    def aggregate(self, inputs: Tensor, index: Tensor, ptr: Optional[Tensor] = None,
+                  dim_size: Optional[int] = None) -> Tensor:
+        weighted_value, updated_edge, prob = inputs
+        weighted_value = scatter(weighted_value, index, dim=self.node_dim,
+                                dim_size=dim_size, reduce=self.aggr)
+        return weighted_value, updated_edge, prob
 
-        updated_edge, transformed_edge = inputs
+    def update(self, inputs, x_ori):
+        weighted_value, updated_edge, prob = inputs
         
-        subj_edge_features = scatter(transformed_edge, index[0], dim=0, dim_size=dim_size, reduce=self.aggr)
+        updated_node = self.nn_node_update(
+            torch.cat([x_ori, weighted_value], dim=1)
+        )
         
-        obj_edge_features = scatter(transformed_edge, index[1], dim=0, dim_size=dim_size, reduce=self.aggr)
-        
-        twinning_edge_attn = subj_edge_features + obj_edge_features
-        
-        return updated_edge, twinning_edge_attn
-
+        return updated_node, updated_edge, prob
+    
 class JointGNN(torch.nn.Module):
     def __init__(self, **kwargs):
         super().__init__()
@@ -1001,54 +1008,40 @@ class BidirectionalEdgeGraphNetwork(torch.nn.Module):
     def __init__(self, **kwargs):
         super().__init__()
         self.num_layers = kwargs['num_layers']
-        self.dim_node = kwargs['dim_node']
-        self.dim_edge = kwargs['dim_edge']
-        self.dim_atten = kwargs['dim_atten']
-        self.num_heads = kwargs['num_heads']
-        self.use_bn = kwargs.get('use_bn', True)
-        self.aggr = kwargs.get('aggr', 'max')
-        self.attn_dropout = kwargs.get('attn_dropout', 0.1)
-        
+
         self.gconvs = torch.nn.ModuleList()
         self.drop_out = None
         if 'DROP_OUT_ATTEN' in kwargs:
             self.drop_out = torch.nn.Dropout(kwargs['DROP_OUT_ATTEN'])
-        
-        for _ in range(self.num_layers):
-            self.gconvs.append(BidirectionalEdgeLayer(
-                dim_node=self.dim_node,
-                dim_edge=self.dim_edge,
-                dim_atten=self.dim_atten,
-                num_heads=self.num_heads,
-                use_bn=self.use_bn,
-                aggr=self.aggr,
-                attn_dropout=self.attn_dropout
-            ))
-    
-    def forward(self, data):
 
+        for _ in range(self.num_layers):
+            self.gconvs.append(filter_args_create(BidirectionalEdgeLayer, kwargs))
+
+    def forward(self, data):
+        probs = list()
         node_feature = data['node'].x
         edge_feature = data['node', 'to', 'node'].x
         edges_indices = data['node', 'to', 'node'].edge_index
         
-        node_pos = data['node'].pos if 'pos' in data['node'] else None
-        
         for i in range(self.num_layers):
             gconv = self.gconvs[i]
-            
-            node_feature, edge_feature = gconv(
-                node_feature, edge_feature, edges_indices, node_pos
-            )
-            
+            node_feature, edge_feature, prob = gconv(
+                node_feature, edge_feature, edges_indices)
+
             if i < (self.num_layers-1) or self.num_layers == 1:
-                node_feature = F.relu(node_feature)
-                edge_feature = F.relu(edge_feature)
-                
+                node_feature = torch.nn.functional.relu(node_feature)
+                edge_feature = torch.nn.functional.relu(edge_feature)
+
                 if self.drop_out:
                     node_feature = self.drop_out(node_feature)
                     edge_feature = self.drop_out(edge_feature)
-        
-        return node_feature, edge_feature, None  # None은 probs 자리
+
+            if prob is not None:
+                probs.append(prob.cpu().detach())
+            else:
+                probs.append(None)
+                
+        return node_feature, edge_feature, probs
 
 
 class FAN_GRU(torch.nn.Module):
