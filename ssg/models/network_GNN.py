@@ -591,7 +591,7 @@ class BidirectionalEdgeLayer(MessagePassing):
     def __init__(self,
                  dim_node: int, dim_edge: int, dim_atten: int,
                  num_heads: int,
-                 use_bn: bool = True,
+                 use_bn: bool = False,
                  aggr='max',
                  attn_dropout: float = 0.3,
                  flow: str = 'target_to_source',
