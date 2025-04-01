@@ -1,0 +1,9 @@
+inherit_from: [configs/dataset/config_base_3RScan_full_l20.yaml,configs/method/config_base_3DSSG_FAN.yaml]
+model:
+ method: mman
+ multi_rel: false # multiple relationship 
+ gnn:
+  method: mman_bi
+wandb:
+ tags: ["ssg", "3dssg","full","l20","mman","edge"]
+
