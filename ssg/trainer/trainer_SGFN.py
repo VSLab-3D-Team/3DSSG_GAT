@@ -6,11 +6,11 @@ import logging
 import ssg
 import time
 import numpy as np
-from tqdm import tqdm  # , tnrange
+from tqdm import tqdm
 from collections import defaultdict
 from codeLib.models import BaseTrainer
 from codeLib.common import check_weights, check_valid, convert_torch_to_scalar
-from ssg.utils.util_eva import EvalSceneGraphBatch, EvalUpperBound  # EvalSceneGraph,
+from ssg.utils.util_eva import EvalSceneGraphBatch, EvalUpperBound
 import codeLib.utils.moving_average as moving_average
 from codeLib.models import BaseTrainer
 from tqdm import tqdm
@@ -19,9 +19,338 @@ from ssg.utils.util_data import match_class_info_from_two, merge_batch_mask2inst
 from ssg import define
 from ssg.utils.graph_vis import DrawSceneGraph
 from ssg.trainer.eval_inst import EvalInst
+import torch.nn.functional as F
 
 logger_py = logging.getLogger(__name__)
 
+class CLIPTextEncoder(torch.nn.Module):
+    def __init__(self, clip_model_name="ViT-B/32"):
+        super().__init__()
+        import clip
+        self.model, _ = clip.load(clip_model_name, device="cpu")
+        self.text_encoder = self.model.encode_text
+        for param in self.parameters():
+            param.requires_grad = False
+    
+    def forward(self, text):
+        import clip
+        text_tokens = clip.tokenize(text).to(next(self.parameters()).device)
+        return self.text_encoder(text_tokens)
+    
+class TripletProjector(torch.nn.Module):
+    def __init__(self, node_dim, edge_dim, output_dim=512):
+        super().__init__()
+        self.proj = torch.nn.Sequential(
+            torch.nn.Linear(node_dim * 2 + edge_dim, 1024),
+            torch.nn.ReLU(),
+            torch.nn.Linear(1024, output_dim)
+        )
+    
+    def forward(self, subj_feat, obj_feat, rel_feat):
+        combined = torch.cat([subj_feat, rel_feat, obj_feat], dim=1)
+        return self.proj(combined)
+
+class Trainer_ALIGN(BaseTrainer, EvalInst):
+    def __init__(self, cfg, model, node_cls_names: list, edge_cls_names: list,
+                 device=None, **kwargs):
+        super().__init__(device)
+        logger_py.setLevel(cfg.log_level)
+        self.cfg = cfg
+        self.model = model
+        self.w_node_cls = kwargs.get('w_node_cls', None)
+        self.w_edge_cls = kwargs.get('w_edge_cls', None)
+        self.node_cls_names = node_cls_names
+        self.edge_cls_names = edge_cls_names
+
+        trainable_params = filter(
+            lambda p: p.requires_grad, model.parameters())
+        self.optimizer = ssg.config.get_optimizer(cfg, trainable_params)
+
+        if self.w_node_cls is not None:
+            logger_py.info('train with weighted node class.')
+            self.w_node_cls = self.w_node_cls.to(self._device)
+        if self.w_edge_cls is not None:
+            logger_py.info('train with weighted node class.')
+            self.w_edge_cls = self.w_edge_cls.to(self._device)
+
+        self.eva_tool = EvalSceneGraphBatch(
+            self.node_cls_names, self.edge_cls_names,
+            save_prediction=False,
+            multi_rel_prediction=self.cfg.model.multi_rel,
+            k=0, none_name=define.NAME_NONE)
+
+        self.loss_node_cls = torch.nn.CrossEntropyLoss(weight=self.w_node_cls)
+        if self.cfg.model.multi_rel:
+            self.loss_rel_cls = torch.nn.BCEWithLogitsLoss(
+                pos_weight=self.w_edge_cls)
+        else:
+            self.loss_rel_cls = torch.nn.CrossEntropyLoss(
+                weight=self.w_edge_cls)
+            
+        self.clip_text_encoder = CLIPTextEncoder(cfg.clip_model_name)
+        self.clip_text_encoder.to(self._device)
+        
+        node_dim = model.get_node_dim() if hasattr(model, 'get_node_dim') else 256
+        edge_dim = model.get_edge_dim() if hasattr(model, 'get_edge_dim') else 256
+        self.triplet_projector = TripletProjector(node_dim, edge_dim)
+        self.triplet_projector.to(self._device)
+        
+        self.lambda_clip_obj = cfg.get('lambda_clip_obj', 1.0)
+        self.lambda_clip_rel = cfg.get('lambda_clip_rel', 1.0)
+        self.lambda_clip_pred = cfg.get('lambda_clip_pred', 1.0)
+        
+        self._text_embeddings_cache = {}
+
+    def _get_text_embedding(self, text_template, fill_values):
+        text = text_template.format(**fill_values)
+        
+        if text in self._text_embeddings_cache:
+            return self._text_embeddings_cache[text]
+        
+        with torch.no_grad():
+            embedding = self.clip_text_encoder([text])
+            embedding = F.normalize(embedding, p=2, dim=1)
+            self._text_embeddings_cache[text] = embedding
+            
+        return embedding
+
+    def zero_metrics(self):
+        self.eva_tool.reset()
+
+    def evaluate(self, val_loader, topk):
+        it_dataset = val_loader.__iter__()
+        eval_tool = EvalSceneGraphBatch(
+            self.node_cls_names, self.edge_cls_names,
+            multi_rel_prediction=self.cfg.model.multi_rel,
+            k=topk, save_prediction=True, none_name=define.NAME_NONE)
+        eval_list = defaultdict(moving_average.MA)
+
+        for data in tqdm(it_dataset, leave=False):
+            eval_step_dict = self.eval_step(data, eval_tool=eval_tool)
+
+            for k, v in eval_step_dict.items():
+                eval_list[k].update(v)
+
+        eval_dict = dict()
+        obj_, edge_ = eval_tool.get_mean_metrics()
+        for k, v in obj_.items():
+            eval_dict[k+'_node_cls'] = v
+        for k, v in edge_.items():
+            eval_dict[k+'_edge_cls'] = v
+
+        for k, v in eval_list.items():
+            eval_dict[k] = v.avg
+
+        vis = self.visualize(eval_tool=eval_tool)
+        eval_dict['visualization'] = vis
+        del it_dataset
+        return eval_dict, eval_tool
+
+    def train_step(self, data, it=None):
+        self.model.train()
+        self.optimizer.zero_grad()
+        logs = self.compute_loss(data, it=it, eval_tool=self.eva_tool)
+        if 'loss' not in logs:
+            return logs
+
+        if not check_valid(logs):
+            logs['loss'].backward()
+            check_weights(self.model.state_dict())
+            self.optimizer.step()
+        else:
+            logger_py.info('skip loss backward due to nan occurs')
+        return logs
+
+    def eval_step(self, data, eval_tool=None):
+        self.model.eval()
+        eval_dict = {}
+        with torch.no_grad():
+            eval_dict = self.compute_loss(
+                data, eval_mode=True, eval_tool=eval_tool)
+        eval_dict = convert_torch_to_scalar(eval_dict)
+        return eval_dict
+
+    def compute_loss(self, data, eval_mode=False, it=None, eval_tool=None):
+        logs = {}
+
+        data = data.to(self._device)
+        
+        gt_node = data['node'].y
+        gt_edge = data['node', 'to', 'node'].y
+        
+        node_cls, edge_cls = self.model(data)
+        
+        node_features = data['node'].x 
+        edge_features = data['node', 'to', 'node'].x if hasattr(data['node', 'to', 'node'], 'x') else None  # 엣지 특징
+        
+        logs['loss'] = 0
+        
+        if self.cfg.training.lambda_mode == 'dynamic':
+            batch_node = node_cls.shape[0]
+            self.cfg.training.lambda_node = 1
+
+            if edge_cls is not None:
+                batch_edge = edge_cls.shape[0]
+                self.cfg.training.lambda_edge = batch_edge / batch_node
+
+        self.calc_node_loss(logs, node_cls, gt_node, self.w_node_cls)
+
+        if edge_cls is not None:
+            if edge_cls.shape[0] != gt_edge.shape[0]:
+                if not eval_mode:
+                    print(f"Warning: Size mismatch between edge_cls {edge_cls.shape} and gt_edge {gt_edge.shape}")
+                    
+                    min_edges = min(edge_cls.shape[0], gt_edge.shape[0])
+                    edge_cls = edge_cls[:min_edges]
+                    gt_edge = gt_edge[:min_edges]
+                    
+                    data['node', 'to', 'node'].y = gt_edge
+                    
+                    print(f"Adjusted edge_cls and gt_edge to size {min_edges}")
+                else:
+                    print(f"Error: Size mismatch in eval mode between edge_cls {edge_cls.shape} and gt_edge {gt_edge.shape}")
+                    return logs
+                    
+            self.calc_edge_loss(logs, edge_cls, gt_edge, self.w_edge_cls)
+            
+            if not eval_mode and edge_features is not None:
+                edge_index = data['node', 'to', 'node'].edge_index
+                
+                batch_size = min(128, edge_index.shape[1])
+                if batch_size > 0:
+                    sample_indices = torch.randperm(edge_index.shape[1])[:batch_size]
+                    sampled_edges = edge_index[:, sample_indices]
+                    
+                    subject_indices = sampled_edges[0]
+                    object_indices = sampled_edges[1]
+                    subject_features = node_features[subject_indices]
+                    object_features = node_features[object_indices]
+                    relation_features = edge_features[sample_indices] if edge_features is not None else torch.zeros_like(subject_features)
+                    
+                    subject_cls_pred = torch.softmax(node_cls[subject_indices], dim=1)
+                    object_cls_pred = torch.softmax(node_cls[object_indices], dim=1)
+                    relation_cls_pred = torch.softmax(edge_cls[sample_indices], dim=1) if not self.cfg.model.multi_rel else torch.sigmoid(edge_cls[sample_indices])
+                    
+                    subject_cls_idx = subject_cls_pred.argmax(dim=1)
+                    object_cls_idx = object_cls_pred.argmax(dim=1)
+                    relation_cls_idx = relation_cls_pred.argmax(dim=1) if not self.cfg.model.multi_rel else relation_cls_pred > 0.5
+                    
+                    clip_obj_loss = 0
+                    clip_pred_loss = 0
+                    clip_rel_loss = 0
+                    
+                    for i in range(batch_size):
+                        subject_name = self.node_cls_names[subject_cls_idx[i]]
+                        object_name = self.node_cls_names[object_cls_idx[i]]
+                        
+                        if self.cfg.model.multi_rel:
+                            rel_idx = relation_cls_pred[i].argmax().item()
+                            relation_name = self.edge_cls_names[rel_idx]
+                        else:
+                            relation_name = self.edge_cls_names[relation_cls_idx[i]]
+                        
+                        subject_text_emb = self._get_text_embedding("a point cloud of a {obj}", {"obj": subject_name})
+                        object_text_emb = self._get_text_embedding("a point cloud of a {obj}", {"obj": object_name})
+                        
+                        relation_text_emb = self._get_text_embedding("{pred}", {"pred": relation_name})
+                        
+                        triplet_text_emb = self._get_text_embedding(
+                            "a point cloud of a {subj} {pred} a {obj}", 
+                            {"subj": subject_name, "pred": relation_name, "obj": object_name}
+                        )
+                        
+                        triplet_feature = self.triplet_projector(
+                            subject_features[i].unsqueeze(0), 
+                            object_features[i].unsqueeze(0), 
+                            relation_features[i].unsqueeze(0)
+                        )
+                        triplet_feature = F.normalize(triplet_feature, p=2, dim=1)
+                        
+                        subj_feat_norm = F.normalize(subject_features[i].unsqueeze(0), p=2, dim=1)
+                        obj_feat_norm = F.normalize(object_features[i].unsqueeze(0), p=2, dim=1)
+                        rel_feat_norm = F.normalize(relation_features[i].unsqueeze(0), p=2, dim=1)
+                        
+                        clip_obj_loss += (1 - F.cosine_similarity(subj_feat_norm, subject_text_emb)).mean()
+                        clip_obj_loss += (1 - F.cosine_similarity(obj_feat_norm, object_text_emb)).mean()
+                        clip_pred_loss += (1 - F.cosine_similarity(rel_feat_norm, relation_text_emb)).mean()
+                        clip_rel_loss += (1 - F.cosine_similarity(triplet_feature, triplet_text_emb)).mean()
+                    
+                    clip_obj_loss = clip_obj_loss / (2 * batch_size)
+                    clip_pred_loss = clip_pred_loss / batch_size
+                    clip_rel_loss = clip_rel_loss / batch_size
+                    
+                    logs['loss_clip_obj'] = clip_obj_loss
+                    logs['loss_clip_pred'] = clip_pred_loss
+                    logs['loss_clip_rel'] = clip_rel_loss
+                    
+                    logs['loss'] += self.lambda_clip_obj * clip_obj_loss
+                    logs['loss'] += self.lambda_clip_pred * clip_pred_loss
+                    logs['loss'] += self.lambda_clip_rel * clip_rel_loss
+
+        metrics = self.model.calculate_metrics(
+            node_cls_pred=node_cls,
+            node_cls_gt=gt_node,
+            edge_cls_pred=edge_cls,
+            edge_cls_gt=gt_edge
+        )
+        for k, v in metrics.items():
+            logs[k] = v
+
+        if eval_tool is not None:
+            node_cls = torch.softmax(node_cls.detach(), dim=1)
+            data['node'].pd = node_cls.detach()
+
+            if edge_cls is not None:
+                if 'edge_index_original' not in data['node', 'to', 'node']:
+                    data['node', 'to', 'node'].edge_index_original = data['node', 'to', 'node'].edge_index.clone()
+                
+                if edge_cls.shape[0] != data['node', 'to', 'node'].edge_index.shape[1]:
+                    data['node', 'to', 'node'].edge_index = data['node', 'to', 'node'].edge_index_original[:, :edge_cls.shape[0]]
+                    print(f"Adjusted edge_index from {data['node', 'to', 'node'].edge_index_original.shape} to {data['node', 'to', 'node'].edge_index.shape}")
+                
+                edge_cls = torch.sigmoid(edge_cls.detach()) if self.cfg.model.multi_rel else torch.softmax(edge_cls.detach(), dim=1)
+                data['node', 'to', 'node'].pd = edge_cls.detach()
+            
+            eval_tool.add(data)
+
+        return logs
+
+    def calc_node_loss(self, logs, node_cls_pred, node_cls_gt, weights=None):
+        loss_obj = self.loss_node_cls(node_cls_pred, node_cls_gt)
+        logs['loss'] += self.cfg.training.lambda_node * loss_obj
+        logs['loss_obj'] = loss_obj
+
+    def calc_edge_loss(self, logs, edge_cls_pred, edge_cls_gt, weights=None):
+        if self.cfg.model.multi_rel:
+            loss_rel = self.loss_rel_cls(edge_cls_pred, edge_cls_gt)
+        else:
+            loss_rel = self.loss_rel_cls(edge_cls_pred, edge_cls_gt)
+        logs['loss'] += self.cfg.training.lambda_edge * loss_rel
+        logs['loss_rel'] = loss_rel
+
+    def visualize(self, eval_tool=None):
+        if eval_tool is None:
+            eval_tool = self.eva_tool
+        node_confusion_matrix, edge_confusion_matrix = eval_tool.draw(
+            plot_text=False,
+            grid=False,
+            normalize='log',
+            plot=False
+        )
+        return {
+            'node_confusion_matrix': node_confusion_matrix,
+            'edge_confusion_matrix': edge_confusion_matrix
+        }
+
+    def get_log_metrics(self):
+        output = dict()
+        obj_, edge_ = self.eva_tool.get_mean_metrics()
+
+        for k, v in obj_.items():
+            output[k+'_node_cls'] = v
+        for k, v in edge_.items():
+            output[k+'_edge_cls'] = v
+        return output
 
 class Trainer_SGFN(BaseTrainer, EvalInst):
     def __init__(self, cfg, model, node_cls_names: list, edge_cls_names: list,
