@@ -13,7 +13,7 @@ model:
   hidden_dim: 256
   num_layers: 2
   num_heads: 8
-  drop_out: 0.3
+  drop_out: 0.1
   node_from_gnn: true
 #  node_classifier:
 #   with_bn: false
