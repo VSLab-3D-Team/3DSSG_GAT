@@ -319,7 +319,6 @@ class NodeToEdgeAggregator(torch.nn.Module):
                  aggregators: List[str] = ['max', 'avg', 'diff'],
                  use_grouped: bool = True,
                  use_mlp: bool = False):
-
         super().__init__()
         self.dim_node = dim_node
         self.dim_edge = dim_edge
@@ -331,16 +330,18 @@ class NodeToEdgeAggregator(torch.nn.Module):
         
         if use_grouped:
             self.group_dim = dim_node // self.num_groups
-            self.total_group_dim = self.group_dim * self.num_groups
             
-            if self.total_group_dim != dim_node:
-                print(f"Warning: dim_node({dim_node})가 num_groups({self.num_groups})로 나누어 떨어지지 않습니다. {self.total_group_dim}로 조정됩니다.")
+            self.last_group_dim = dim_node - (self.group_dim * (self.num_groups - 1))
+            
+            self.group_dims = [self.group_dim] * (self.num_groups - 1) + [self.last_group_dim]
+            
+            self.output_dim = sum(self.group_dims)
         
         if use_mlp:
             if use_grouped:
-                self.output_mlp = build_mlp([dim_node, dim_edge], do_bn=True, on_last=False)
+                self.output_mlp = build_mlp([self.output_dim, dim_edge], do_bn=True, on_last=False)
             else:
-                input_dim = dim_node if aggregators[0] != 'diff' else dim_node*2
+                input_dim = dim_node if aggregators[0] != 'diff' else dim_node
                 self.output_mlp = build_mlp([input_dim, dim_edge], do_bn=True, on_last=False)
     
     def forward(self, x_i: Tensor, x_j: Tensor) -> Tensor:
@@ -353,9 +354,10 @@ class NodeToEdgeAggregator(torch.nn.Module):
     def _forward_grouped(self, x_i: Tensor, x_j: Tensor) -> Tensor:
         results = []
         
+        start_idx = 0
         for g in range(self.num_groups):
-            start_idx = g * self.group_dim
-            end_idx = start_idx + self.group_dim
+            curr_dim = self.group_dims[g]
+            end_idx = start_idx + curr_dim
             
             x_i_g = x_i[:, start_idx:end_idx]
             x_j_g = x_j[:, start_idx:end_idx]
@@ -372,6 +374,7 @@ class NodeToEdgeAggregator(torch.nn.Module):
                 raise ValueError(f"Undefined aggregator: {agg_type}")
             
             results.append(result)
+            start_idx = end_idx
         
         edge_feature = torch.cat(results, dim=1)
         
