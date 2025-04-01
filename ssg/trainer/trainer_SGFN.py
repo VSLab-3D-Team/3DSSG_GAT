@@ -121,6 +121,7 @@ class Trainer_ALIGN(BaseTrainer, EvalInst):
             self.triplet_projector = TripletProjector(node_dim, edge_dim)
             self.triplet_projector.to(self._device)
             
+            # 모든 손실 가중치 유지 (주석 처리하지 않음)
             self.lambda_clip_obj = getattr(cfg, 'lambda_clip_obj', 1.0)
             self.lambda_clip_rel = getattr(cfg, 'lambda_clip_rel', 1.0)
             self.lambda_clip_pred = getattr(cfg, 'lambda_clip_pred', 1.0)
@@ -128,10 +129,10 @@ class Trainer_ALIGN(BaseTrainer, EvalInst):
             self._text_embeddings_cache = {}
             
             self.use_lap = True
-            logger_py.info('Model initilaization success.')
+            logger_py.info('LAP 모델 구성요소가 성공적으로 초기화되었습니다.')
             
         except Exception as e:
-            logger_py.warning(f'Model initilaization failed: {str(e)}')
+            logger_py.warning(f'LAP 모델 초기화 실패: {str(e)}')
             self.use_lap = False
 
     def _get_text_embedding(self, text_template, fill_values):
@@ -307,24 +308,26 @@ class Trainer_ALIGN(BaseTrainer, EvalInst):
                             obj_feat_norm = F.normalize(object_features[i].unsqueeze(0), p=2, dim=1)
                             rel_feat_norm = F.normalize(relation_features[i].unsqueeze(0), p=2, dim=1)
                             
-                            clip_obj_loss += (1 - F.cosine_similarity(subj_feat_norm, subject_text_emb)).mean()
-                            clip_obj_loss += (1 - F.cosine_similarity(obj_feat_norm, object_text_emb)).mean()
-                            clip_pred_loss += (1 - F.cosine_similarity(rel_feat_norm, relation_text_emb)).mean()
+                            # clip_obj_loss += (1 - F.cosine_similarity(subj_feat_norm, subject_text_emb)).mean()
+                            # clip_obj_loss += (1 - F.cosine_similarity(obj_feat_norm, object_text_emb)).mean()
+                            
+                            # clip_pred_loss += (1 - F.cosine_similarity(rel_feat_norm, relation_text_emb)).mean()
+                            
                             clip_rel_loss += (1 - F.cosine_similarity(triplet_feature, triplet_text_emb)).mean()
                         
-                        clip_obj_loss = clip_obj_loss / (2 * batch_size)
-                        clip_pred_loss = clip_pred_loss / batch_size
+                        # clip_obj_loss = clip_obj_loss / (2 * batch_size)  # 주석 처리
+                        # clip_pred_loss = clip_pred_loss / batch_size  # 주석 처리
                         clip_rel_loss = clip_rel_loss / batch_size
                         
-                        logs['loss_clip_obj'] = clip_obj_loss
-                        logs['loss_clip_pred'] = clip_pred_loss
+                        # logs['loss_clip_obj'] = clip_obj_loss  # 주석 처리
+                        # logs['loss_clip_pred'] = clip_pred_loss  # 주석 처리
                         logs['loss_clip_rel'] = clip_rel_loss
                         
-                        logs['loss'] += self.lambda_clip_obj * clip_obj_loss
-                        logs['loss'] += self.lambda_clip_pred * clip_pred_loss
+                        # logs['loss'] += self.lambda_clip_obj * clip_obj_loss  # 주석 처리
+                        # logs['loss'] += self.lambda_clip_pred * clip_pred_loss  # 주석 처리
                         logs['loss'] += self.lambda_clip_rel * clip_rel_loss
                 except Exception as e:
-                    logger_py.warning(f"Error during calculating loss: {str(e)}")
+                    logger_py.warning(f"Error during calculate loss: {str(e)}")
 
         metrics = self.model.calculate_metrics(
             node_cls_pred=node_cls,
