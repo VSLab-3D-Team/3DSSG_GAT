@@ -26,16 +26,28 @@ logger_py = logging.getLogger(__name__)
 class CLIPTextEncoder(torch.nn.Module):
     def __init__(self, clip_model_name="ViT-B/32"):
         super().__init__()
-        import clip
-        self.model, _ = clip.load(clip_model_name, device="cpu")
-        self.text_encoder = self.model.encode_text
-        for param in self.parameters():
-            param.requires_grad = False
+        try:
+            import clip
+            self.model, _ = clip.load(clip_model_name, device="cpu")
+            self.text_encoder = self.model.encode_text
+            for param in self.parameters():
+                param.requires_grad = False
+            self.clip_available = True
+        except Exception as e:
+            logger_py.warning(f"CLIP unavailable: {e}")
+            self.clip_available = False
     
     def forward(self, text):
-        import clip
-        text_tokens = clip.tokenize(text).to(next(self.parameters()).device)
-        return self.text_encoder(text_tokens)
+        if not hasattr(self, 'clip_available') or not self.clip_available:
+            return torch.ones(len(text), 512, device=next(self.parameters()).device)
+        
+        try:
+            import clip
+            text_tokens = clip.tokenize(text).to(next(self.parameters()).device)
+            return self.text_encoder(text_tokens)
+        except Exception as e:
+            logger_py.warning(f"CLIP inference failed: {e}")
+            return torch.ones(len(text), 512, device=next(self.parameters()).device)
     
 class TripletProjector(torch.nn.Module):
     def __init__(self, node_dim, edge_dim, output_dim=512):
@@ -87,21 +99,45 @@ class Trainer_ALIGN(BaseTrainer, EvalInst):
             self.loss_rel_cls = torch.nn.CrossEntropyLoss(
                 weight=self.w_edge_cls)
             
-        self.clip_text_encoder = CLIPTextEncoder(cfg.clip_model_name)
-        self.clip_text_encoder.to(self._device)
-        
-        node_dim = model.get_node_dim() if hasattr(model, 'get_node_dim') else 256
-        edge_dim = model.get_edge_dim() if hasattr(model, 'get_edge_dim') else 256
-        self.triplet_projector = TripletProjector(node_dim, edge_dim)
-        self.triplet_projector.to(self._device)
-        
-        self.lambda_clip_obj = cfg.get('lambda_clip_obj', 1.0)
-        self.lambda_clip_rel = cfg.get('lambda_clip_rel', 1.0)
-        self.lambda_clip_pred = cfg.get('lambda_clip_pred', 1.0)
-        
-        self._text_embeddings_cache = {}
+        try:
+            clip_model_name = getattr(cfg, 'clip_model_name', "ViT-B/32")
+            self.clip_text_encoder = CLIPTextEncoder(clip_model_name)
+            self.clip_text_encoder.to(self._device)
+            
+            if hasattr(model, 'get_node_dim'):
+                node_dim = model.get_node_dim()
+            elif hasattr(model, 'node_dim'):
+                node_dim = model.node_dim
+            else:
+                node_dim = 256
+                
+            if hasattr(model, 'get_edge_dim'):
+                edge_dim = model.get_edge_dim()
+            elif hasattr(model, 'edge_dim'):
+                edge_dim = model.edge_dim
+            else:
+                edge_dim = 256
+            
+            self.triplet_projector = TripletProjector(node_dim, edge_dim)
+            self.triplet_projector.to(self._device)
+            
+            self.lambda_clip_obj = getattr(cfg, 'lambda_clip_obj', 1.0)
+            self.lambda_clip_rel = getattr(cfg, 'lambda_clip_rel', 1.0)
+            self.lambda_clip_pred = getattr(cfg, 'lambda_clip_pred', 1.0)
+            
+            self._text_embeddings_cache = {}
+            
+            self.use_lap = True
+            logger_py.info('Model initilaization success.')
+            
+        except Exception as e:
+            logger_py.warning(f'Model initilaization failed: {str(e)}')
+            self.use_lap = False
 
     def _get_text_embedding(self, text_template, fill_values):
+        if not hasattr(self, 'use_lap') or not self.use_lap:
+            return torch.ones(1, 512, device=self._device)
+            
         text = text_template.format(**fill_values)
         
         if text in self._text_embeddings_cache:
@@ -180,8 +216,8 @@ class Trainer_ALIGN(BaseTrainer, EvalInst):
         
         node_cls, edge_cls = self.model(data)
         
-        node_features = data['node'].x 
-        edge_features = data['node', 'to', 'node'].x if hasattr(data['node', 'to', 'node'], 'x') else None  # 엣지 특징
+        node_features = data['node'].x if hasattr(data['node'], 'x') else None
+        edge_features = data['node', 'to', 'node'].x if hasattr(data['node', 'to', 'node'], 'x') else None
         
         logs['loss'] = 0
         
@@ -213,79 +249,82 @@ class Trainer_ALIGN(BaseTrainer, EvalInst):
                     
             self.calc_edge_loss(logs, edge_cls, gt_edge, self.w_edge_cls)
             
-            if not eval_mode and edge_features is not None:
-                edge_index = data['node', 'to', 'node'].edge_index
-                
-                batch_size = min(128, edge_index.shape[1])
-                if batch_size > 0:
-                    sample_indices = torch.randperm(edge_index.shape[1])[:batch_size]
-                    sampled_edges = edge_index[:, sample_indices]
+            if not eval_mode and hasattr(self, 'use_lap') and self.use_lap and node_features is not None and edge_features is not None:
+                try:
+                    edge_index = data['node', 'to', 'node'].edge_index
                     
-                    subject_indices = sampled_edges[0]
-                    object_indices = sampled_edges[1]
-                    subject_features = node_features[subject_indices]
-                    object_features = node_features[object_indices]
-                    relation_features = edge_features[sample_indices] if edge_features is not None else torch.zeros_like(subject_features)
-                    
-                    subject_cls_pred = torch.softmax(node_cls[subject_indices], dim=1)
-                    object_cls_pred = torch.softmax(node_cls[object_indices], dim=1)
-                    relation_cls_pred = torch.softmax(edge_cls[sample_indices], dim=1) if not self.cfg.model.multi_rel else torch.sigmoid(edge_cls[sample_indices])
-                    
-                    subject_cls_idx = subject_cls_pred.argmax(dim=1)
-                    object_cls_idx = object_cls_pred.argmax(dim=1)
-                    relation_cls_idx = relation_cls_pred.argmax(dim=1) if not self.cfg.model.multi_rel else relation_cls_pred > 0.5
-                    
-                    clip_obj_loss = 0
-                    clip_pred_loss = 0
-                    clip_rel_loss = 0
-                    
-                    for i in range(batch_size):
-                        subject_name = self.node_cls_names[subject_cls_idx[i]]
-                        object_name = self.node_cls_names[object_cls_idx[i]]
+                    batch_size = min(128, edge_index.shape[1])
+                    if batch_size > 0:
+                        sample_indices = torch.randperm(edge_index.shape[1])[:batch_size]
+                        sampled_edges = edge_index[:, sample_indices]
                         
-                        if self.cfg.model.multi_rel:
-                            rel_idx = relation_cls_pred[i].argmax().item()
-                            relation_name = self.edge_cls_names[rel_idx]
-                        else:
-                            relation_name = self.edge_cls_names[relation_cls_idx[i]]
+                        subject_indices = sampled_edges[0]
+                        object_indices = sampled_edges[1]
+                        subject_features = node_features[subject_indices]
+                        object_features = node_features[object_indices]
+                        relation_features = edge_features[sample_indices]
                         
-                        subject_text_emb = self._get_text_embedding("a point cloud of a {obj}", {"obj": subject_name})
-                        object_text_emb = self._get_text_embedding("a point cloud of a {obj}", {"obj": object_name})
+                        subject_cls_pred = torch.softmax(node_cls[subject_indices], dim=1)
+                        object_cls_pred = torch.softmax(node_cls[object_indices], dim=1)
+                        relation_cls_pred = torch.softmax(edge_cls[sample_indices], dim=1) if not self.cfg.model.multi_rel else torch.sigmoid(edge_cls[sample_indices])
                         
-                        relation_text_emb = self._get_text_embedding("{pred}", {"pred": relation_name})
+                        subject_cls_idx = subject_cls_pred.argmax(dim=1)
+                        object_cls_idx = object_cls_pred.argmax(dim=1)
+                        relation_cls_idx = relation_cls_pred.argmax(dim=1) if not self.cfg.model.multi_rel else relation_cls_pred > 0.5
                         
-                        triplet_text_emb = self._get_text_embedding(
-                            "a point cloud of a {subj} {pred} a {obj}", 
-                            {"subj": subject_name, "pred": relation_name, "obj": object_name}
-                        )
+                        clip_obj_loss = 0
+                        clip_pred_loss = 0
+                        clip_rel_loss = 0
                         
-                        triplet_feature = self.triplet_projector(
-                            subject_features[i].unsqueeze(0), 
-                            object_features[i].unsqueeze(0), 
-                            relation_features[i].unsqueeze(0)
-                        )
-                        triplet_feature = F.normalize(triplet_feature, p=2, dim=1)
+                        for i in range(batch_size):
+                            subject_name = self.node_cls_names[subject_cls_idx[i]]
+                            object_name = self.node_cls_names[object_cls_idx[i]]
+                            
+                            if self.cfg.model.multi_rel:
+                                rel_idx = relation_cls_pred[i].argmax().item()
+                                relation_name = self.edge_cls_names[rel_idx]
+                            else:
+                                relation_name = self.edge_cls_names[relation_cls_idx[i]]
+                            
+                            subject_text_emb = self._get_text_embedding("a point cloud of a {obj}", {"obj": subject_name})
+                            object_text_emb = self._get_text_embedding("a point cloud of a {obj}", {"obj": object_name})
+                            
+                            relation_text_emb = self._get_text_embedding("{pred}", {"pred": relation_name})
+                            
+                            triplet_text_emb = self._get_text_embedding(
+                                "a point cloud of a {subj} {pred} a {obj}", 
+                                {"subj": subject_name, "pred": relation_name, "obj": object_name}
+                            )
+                            
+                            triplet_feature = self.triplet_projector(
+                                subject_features[i].unsqueeze(0), 
+                                object_features[i].unsqueeze(0), 
+                                relation_features[i].unsqueeze(0)
+                            )
+                            triplet_feature = F.normalize(triplet_feature, p=2, dim=1)
+                            
+                            subj_feat_norm = F.normalize(subject_features[i].unsqueeze(0), p=2, dim=1)
+                            obj_feat_norm = F.normalize(object_features[i].unsqueeze(0), p=2, dim=1)
+                            rel_feat_norm = F.normalize(relation_features[i].unsqueeze(0), p=2, dim=1)
+                            
+                            clip_obj_loss += (1 - F.cosine_similarity(subj_feat_norm, subject_text_emb)).mean()
+                            clip_obj_loss += (1 - F.cosine_similarity(obj_feat_norm, object_text_emb)).mean()
+                            clip_pred_loss += (1 - F.cosine_similarity(rel_feat_norm, relation_text_emb)).mean()
+                            clip_rel_loss += (1 - F.cosine_similarity(triplet_feature, triplet_text_emb)).mean()
                         
-                        subj_feat_norm = F.normalize(subject_features[i].unsqueeze(0), p=2, dim=1)
-                        obj_feat_norm = F.normalize(object_features[i].unsqueeze(0), p=2, dim=1)
-                        rel_feat_norm = F.normalize(relation_features[i].unsqueeze(0), p=2, dim=1)
+                        clip_obj_loss = clip_obj_loss / (2 * batch_size)
+                        clip_pred_loss = clip_pred_loss / batch_size
+                        clip_rel_loss = clip_rel_loss / batch_size
                         
-                        clip_obj_loss += (1 - F.cosine_similarity(subj_feat_norm, subject_text_emb)).mean()
-                        clip_obj_loss += (1 - F.cosine_similarity(obj_feat_norm, object_text_emb)).mean()
-                        clip_pred_loss += (1 - F.cosine_similarity(rel_feat_norm, relation_text_emb)).mean()
-                        clip_rel_loss += (1 - F.cosine_similarity(triplet_feature, triplet_text_emb)).mean()
-                    
-                    clip_obj_loss = clip_obj_loss / (2 * batch_size)
-                    clip_pred_loss = clip_pred_loss / batch_size
-                    clip_rel_loss = clip_rel_loss / batch_size
-                    
-                    logs['loss_clip_obj'] = clip_obj_loss
-                    logs['loss_clip_pred'] = clip_pred_loss
-                    logs['loss_clip_rel'] = clip_rel_loss
-                    
-                    logs['loss'] += self.lambda_clip_obj * clip_obj_loss
-                    logs['loss'] += self.lambda_clip_pred * clip_pred_loss
-                    logs['loss'] += self.lambda_clip_rel * clip_rel_loss
+                        logs['loss_clip_obj'] = clip_obj_loss
+                        logs['loss_clip_pred'] = clip_pred_loss
+                        logs['loss_clip_rel'] = clip_rel_loss
+                        
+                        logs['loss'] += self.lambda_clip_obj * clip_obj_loss
+                        logs['loss'] += self.lambda_clip_pred * clip_pred_loss
+                        logs['loss'] += self.lambda_clip_rel * clip_rel_loss
+                except Exception as e:
+                    logger_py.warning(f"Error during calculating loss: {str(e)}")
 
         metrics = self.model.calculate_metrics(
             node_cls_pred=node_cls,
