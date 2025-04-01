@@ -312,6 +312,92 @@ class MSG_MV_DIRECT(MessagePassing):
             x += node
         return x
 
+class NodeToEdgeAggregator(torch.nn.Module):
+    def __init__(self, 
+                 dim_node: int, 
+                 dim_edge: int,
+                 aggregators: List[str] = ['max', 'avg', 'diff'],
+                 use_grouped: bool = True,
+                 use_mlp: bool = False):
+
+        super().__init__()
+        self.dim_node = dim_node
+        self.dim_edge = dim_edge
+        self.aggregators = aggregators
+        self.use_grouped = use_grouped
+        self.use_mlp = use_mlp
+        
+        self.num_groups = len(aggregators) if use_grouped else 1
+        
+        if use_grouped:
+            self.group_dim = dim_node // self.num_groups
+            self.total_group_dim = self.group_dim * self.num_groups
+            
+            if self.total_group_dim != dim_node:
+                print(f"Warning: dim_node({dim_node})가 num_groups({self.num_groups})로 나누어 떨어지지 않습니다. {self.total_group_dim}로 조정됩니다.")
+        
+        if use_mlp:
+            if use_grouped:
+                self.output_mlp = build_mlp([dim_node, dim_edge], do_bn=True, on_last=False)
+            else:
+                input_dim = dim_node if aggregators[0] != 'diff' else dim_node*2
+                self.output_mlp = build_mlp([input_dim, dim_edge], do_bn=True, on_last=False)
+    
+    def forward(self, x_i: Tensor, x_j: Tensor) -> Tensor:
+
+        if self.use_grouped:
+            return self._forward_grouped(x_i, x_j)
+        else:
+            return self._forward_single(x_i, x_j)
+    
+    def _forward_grouped(self, x_i: Tensor, x_j: Tensor) -> Tensor:
+        results = []
+        
+        for g in range(self.num_groups):
+            start_idx = g * self.group_dim
+            end_idx = start_idx + self.group_dim
+            
+            x_i_g = x_i[:, start_idx:end_idx]
+            x_j_g = x_j[:, start_idx:end_idx]
+            
+            agg_type = self.aggregators[g]
+            
+            if agg_type == 'max':
+                result = torch.max(x_i_g, x_j_g)
+            elif agg_type == 'avg':
+                result = (x_i_g + x_j_g) / 2
+            elif agg_type == 'diff':
+                result = torch.abs(x_i_g - x_j_g)
+            else:
+                raise ValueError(f"Undefined aggregator: {agg_type}")
+            
+            results.append(result)
+        
+        edge_feature = torch.cat(results, dim=1)
+        
+        if self.use_mlp:
+            edge_feature = self.output_mlp(edge_feature)
+            
+        return edge_feature
+    
+    def _forward_single(self, x_i: Tensor, x_j: Tensor) -> Tensor:
+        agg_type = self.aggregators[0]
+        
+        if agg_type == 'max':
+            edge_feature = torch.max(x_i, x_j)
+        elif agg_type == 'avg':
+            edge_feature = (x_i + x_j) / 2
+        elif agg_type == 'diff':
+            edge_feature = torch.abs(x_i - x_j)
+        elif agg_type == 'concat':
+            edge_feature = torch.cat([x_i, x_j], dim=1)
+        else:
+            raise ValueError(f"Undefined aggregator: {agg_type}")
+        
+        if self.use_mlp:
+            edge_feature = self.output_mlp(edge_feature)
+            
+        return edge_feature
 
 class MSG_FAN(MessagePassing):
     def __init__(self,
@@ -595,7 +681,10 @@ class BidirectionalEdgeLayer(MessagePassing):
                  aggr='max',
                  attn_dropout: float = 0.3,
                  flow: str = 'target_to_source',
-                 use_distance_mask: bool = True):
+                 use_distance_mask: bool = True,
+                 node2edge_aggregators: List[str] = ['max', 'avg', 'diff'],
+                 use_grouped_aggregation: bool = True,
+                 use_node2edge_mlp: bool = True):
         super().__init__(aggr=aggr, flow=flow)
         assert dim_node % num_heads == 0
         assert dim_edge % num_heads == 0
@@ -609,6 +698,10 @@ class BidirectionalEdgeLayer(MessagePassing):
         self.dim_edge = dim_edge
         self.dim_atten = dim_atten
         self.use_distance_mask = use_distance_mask
+        
+        self.node2edge_aggregators = node2edge_aggregators
+        self.use_grouped_aggregation = use_grouped_aggregation
+        self.use_node2edge_mlp = use_node2edge_mlp
 
         self.proj_q = build_mlp([dim_node, dim_node])
         self.proj_v = build_mlp([dim_node, dim_atten])
@@ -617,7 +710,15 @@ class BidirectionalEdgeLayer(MessagePassing):
         
         self.distance_mlp = build_mlp([4, 32, 1], do_bn=use_bn, on_last=False)
         
-        self.nn_edge_update = build_mlp([dim_node*2+dim_edge*2, dim_node+dim_edge*2, dim_edge],
+        self.node2edge = NodeToEdgeAggregator(
+            dim_node=dim_node,
+            dim_edge=dim_edge,
+            aggregators=node2edge_aggregators,
+            use_grouped=use_grouped_aggregation,
+            use_mlp=use_node2edge_mlp
+        )
+        
+        self.nn_edge_update = build_mlp([dim_edge+dim_edge*2, dim_edge],
                                        do_bn=use_bn, on_last=False)
         
         self.edge_attention_mlp = build_mlp([dim_edge*2, dim_edge], do_bn=use_bn, on_last=False)
@@ -724,8 +825,10 @@ class BidirectionalEdgeLayer(MessagePassing):
         '''
         num_edge = x_i.size(0)
         
+        node2edge_feature = self.node2edge(x_i, x_j)
+        
         updated_edge = self.nn_edge_update(
-            torch.cat([x_i, edge_feature, reverse_edge_feature, x_j], dim=1)
+            torch.cat([node2edge_feature, edge_feature, reverse_edge_feature], dim=1)
         )
         
         x_i_proj = self.proj_q(x_i).view(
